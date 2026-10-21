@@ -33,7 +33,7 @@ LodPocMod &LodPocMod::instance() {
 }
 
 LodPocMod::LodPocMod()
-    : mSelf(ll::mod::NativeMod::current()),
+    : mSelf(*ll::mod::NativeMod::current()),
       mLastLightingReport(std::chrono::steady_clock::now()),
       mLastFpsReport(std::chrono::steady_clock::now()),
       mLastCullReport(std::chrono::steady_clock::now()) {}
