@@ -1,0 +1,10 @@
+build*/
+out/
+dist/
+.vs/
+.vscode/.cmake/
+.idea/
+*.zip
+*.so
+*.log
+*.xcrash
