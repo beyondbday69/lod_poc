@@ -30,6 +30,9 @@ struct ModConfig {
     /** Enable background LevelDB world data reader and top-down LOD map generation */
     bool buildLodMap = true;
 
+    /** Optional periodic world rescan interval in seconds (0 = scan once). */
+    int rescanIntervalSec = 0;
+
     /** Probe A: GL Frame Trace */
     bool traceFrame = true;
     bool traceRaw = false;

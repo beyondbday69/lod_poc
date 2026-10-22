@@ -37,7 +37,8 @@ LodTileMesh LodMeshBuilder::buildTileMesh(
 
     // 1. Sample downsampled height and color per cell vertex
     std::vector<float> gridHeights(vertGridSize * vertGridSize, 64.0f);
-    std::vector<RGB> gridColors(vertGridSize * vertGridSize, {95, 159, 53});
+    // Missing/unresolved terrain must never look like valid grass.
+    std::vector<RGB> gridColors(vertGridSize * vertGridSize, kUnresolvedColor);
 
     for (int gz = 0; gz < vertGridSize; ++gz) {
         for (int gx = 0; gx < vertGridSize; ++gx) {
@@ -51,7 +52,8 @@ LodTileMesh LodMeshBuilder::buildTileMesh(
 
             const int localBlockX = blockX % 16;
             const int localBlockZ = blockZ % 16;
-            const int colIdx = (localBlockZ << 4) | localBlockX;
+            // World reader stores columns as (x << 4) | z.
+            const int colIdx = (localBlockX << 4) | localBlockZ;
 
             const uint64_t cKey = makeChunkCoordKey(targetChunkX, targetChunkZ);
             auto it = chunks.find(cKey);

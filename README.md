@@ -127,10 +127,54 @@ Stored in `<mod_config_dir>/config.json` (or `<mod_data_dir>/config.json`):
 | `userNote` | string | `""` | Free-form notes with your recorded player coordinates at T1/T2/T3. |
 | `requireKnownBuild` | boolean | `true` | When true (default), signature-based probes are skipped if the loaded `libminecraftpe.so` GNU build-id does not match `712509dc14ccc233e91f267937dfb46ecdcc4b68`. |
 | `buildLodMap` | boolean | `true` | Enables background LevelDB scan and generation of `lod_map.png`. |
+| `rescanIntervalSec` | integer | `0` | Optional periodic world rescan interval in seconds. `0` scans once. The first scan waits for the game to open the world database. |
 | `probe_chunk_lighting` | boolean | `true` | Enables Probe 1 `ChunkSource::_lightingTask` hook. |
 | `probe_bind_framebuffer` | boolean | `true` | Enables Probe 2 FBO tracking. |
 | `probe_egl_swap_buffers` | boolean | `true` | Enables Probe 3 FPS and frame swap tracking. |
 | `probe_level_renderer_cull` | boolean | `true` | Enables Probe 5 `LevelRendererCamera::cullPointOrChunk` hook. |
+
+---
+
+## World Reader (Bedrock LevelDB)
+
+The world reader runs entirely on a detached background thread and never scans
+on the render thread.
+
+- **Discovery**: At enable, a poller checks `/proc/self/fd` every 3 seconds for
+  an open file under a `.../db/` directory (`.ldb`, `.log`, `MANIFEST*`, or
+  `CURRENT`). It logs `waiting for world...` at start and every 30 seconds, and
+  gives up after 15 minutes. This avoids the old failure where scanning ran
+  before Minecraft opened the world database.
+- **Scan order**: Once discovered, all `*.ldb` files are read in ascending
+  file-number order. LevelDB internal keys have their 8-byte trailer
+  `(sequence << 8) | type` stripped. For each user key, the highest sequence
+  across all files wins; type `0` deletions are honored. Overworld chunk keys
+  are 9 or 10 bytes (`x, z, tag[, subY]`); 13/14-byte dimension keys are
+  ignored.
+- **Formats**:
+  - Real little-endian NBT palette parsing (root compound `0x0A`, empty root
+    name, nested tags through `End`). Palette entries are read from their
+    `name` string.
+  - SubChunk versions 8 and 9, including one or more block layers, palette
+    type 0 (int32 count) and type 1 (zigzag varint count), bits per block
+    `1..6, 8, 16`, little-endian 32-bit words, and YZX block order
+    `(x << 8) | (z << 4) | y`.
+  - Per column, SubChunks are scanned from the highest Y downward for the
+    first non-air block. Plants and transparent decoration such as
+    `tall_grass`, flowers, `snow_layer`, carpets, and coral fans are skipped
+    when identifiable. Water counts as a top block.
+  - Data3D (`0x2B`) is used only as a fallback height (`raw - 64`, clamped to
+    `-64..319`) and for a first-10-chunk cross-check log. SubChunk data is
+    authoritative. Data2D (`0x2D`) is counted as unsupported.
+- **Colors**: Resolved blocks use the block palette. Unresolved columns are
+  visible dark gray `(64,64,64)`; parse failures are magenta `(255,0,255)`.
+  The log reports resolved/unresolved/parse-error column counts, 5 sample
+  chunks, and the top 20 top-block names.
+- **Outputs**: `lod_map.png` is written next to `lod_poc.log` and, when the
+  directory exists, copied to
+  `/storage/emulated/0/Download/lod_map.png`.
+- **Rescan**: `rescanIntervalSec` defaults to `0` (scan once). A positive value
+  keeps the worker alive and rescans the discovered database at that interval.
 
 ---
 
@@ -189,6 +233,20 @@ Open `/storage/emulated/0/Download/lod_poc.log` (or retrieve via ADB) and send t
      T3: (x, y, z)
      Delta(T2-T1): ...
      Delta(T3-T2): ...
+   ```
+
+5. **World Reader**:
+   ```text
+   [LOD Reader] waiting for world... polling /proc/self/fd ...
+   [LOD Reader] Discovered active world DB directory: ...
+   [LOD Reader] Found N .ldb files ... scanning in ascending file-number order
+   [LOD Reader] LevelDB records: total=..., overworld=..., ...
+   [LOD Reader] SubChunk versions: v8=..., v9=...; skipped: ...
+   [LOD Reader] Data3D cross-check chunk (x, z): ...
+   [LOD Reader] Finalized N chunks ... resolved=..., unresolved=...
+   [LOD Reader] Sample chunk (x, z): top block at column (8,8) = ...
+   [LOD Reader] Top block #1: ... = ... columns
+   [LOD Map] Saved primary PNG map next to log: ...
    ```
 
 ---

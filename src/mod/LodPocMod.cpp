@@ -373,15 +373,17 @@ bool LodPocMod::enable() {
 
         // Trigger background LevelDB world scan if enabled
         bool shouldScanWorld = true;
+        int rescanIntervalSec = 0;
         {
             std::lock_guard lock(mConfigMutex);
             if (mConfigFile) {
                 shouldScanWorld = mConfigFile->value().buildLodMap;
+                rescanIntervalSec = mConfigFile->value().rescanIntervalSec;
             }
         }
         if (shouldScanWorld) {
             try {
-                WorldReader::startBackgroundScan(getSelf().getDataDir());
+                WorldReader::startBackgroundScan(getSelf().getDataDir(), rescanIntervalSec);
             } catch (const std::exception &ex) {
                 logAll(LogLevel::Error, "WorldReader::startBackgroundScan failed: {}", ex.what());
             } catch (...) {
@@ -632,6 +634,12 @@ void LodPocMod::checkConfigReload() {
                 GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel, cfg.traceDelayAfterWorldSec);
                 CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
                 PocQuad::instance().setConfig(cfg.pocQuad, cfg.pocDepth, cfg.pocColor, cfg.pocTrigger, cfg.poc3d, cfg.poc3dDist);
+
+                if (cfg.buildLodMap) {
+                    WorldReader::startBackgroundScan(getSelf().getDataDir(), cfg.rescanIntervalSec);
+                } else {
+                    WorldReader::setRescanIntervalSec(0);
+                }
             }
         }
     }
