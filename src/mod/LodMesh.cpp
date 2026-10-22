@@ -1,6 +1,7 @@
 #include "mod/LodMesh.h"
 
 #include <algorithm>
+#include <climits>
 
 namespace lod_poc {
 namespace {
@@ -90,15 +91,23 @@ LodTileMesh LodMeshBuilder::buildTileMesh(
             const uint32_t v01 = static_cast<uint32_t>((gz + 1) * vertGridSize + gx);
             const uint32_t v11 = static_cast<uint32_t>((gz + 1) * vertGridSize + (gx + 1));
 
-            // Triangle 1
-            mesh.indices.push_back(v00);
-            mesh.indices.push_back(v10);
-            mesh.indices.push_back(v01);
+            // If all 4 vertices belong to unresolved/missing chunks, don't emit geometry
+            if (gridColors[v00] == kUnresolvedColor &&
+                gridColors[v10] == kUnresolvedColor &&
+                gridColors[v01] == kUnresolvedColor &&
+                gridColors[v11] == kUnresolvedColor) {
+                continue;
+            }
 
-            // Triangle 2
-            mesh.indices.push_back(v10);
-            mesh.indices.push_back(v11);
+            // Triangle 1 (CCW when viewed from above: top-left -> bottom-left -> top-right)
+            mesh.indices.push_back(v00);
             mesh.indices.push_back(v01);
+            mesh.indices.push_back(v10);
+
+            // Triangle 2 (CCW when viewed from above: top-right -> bottom-left -> bottom-right)
+            mesh.indices.push_back(v10);
+            mesh.indices.push_back(v01);
+            mesh.indices.push_back(v11);
         }
     }
 
@@ -152,6 +161,57 @@ LodTileMesh LodMeshBuilder::buildTileMesh(
     addSkirtEdge(eastEdge);
 
     return mesh;
+}
+
+std::vector<LodTileMesh> LodMeshBuilder::buildAllTiles(
+    int tier,
+    const std::unordered_map<uint64_t, ChunkColumnData> &chunks) {
+
+    std::vector<LodTileMesh> result;
+    if (chunks.empty()) return result;
+
+    int32_t minX = INT32_MAX, maxX = INT32_MIN;
+    int32_t minZ = INT32_MAX, maxZ = INT32_MIN;
+
+    for (const auto &pair : chunks) {
+        minX = std::min(minX, pair.second.chunkX);
+        maxX = std::max(maxX, pair.second.chunkX);
+        minZ = std::min(minZ, pair.second.chunkZ);
+        maxZ = std::max(maxZ, pair.second.chunkZ);
+    }
+
+    auto floorDiv16 = [](int32_t v) -> int32_t {
+        return (v >= 0) ? (v / 16) : ((v - 15) / 16);
+    };
+
+    const int32_t tileMinX = floorDiv16(minX);
+    const int32_t tileMaxX = floorDiv16(maxX);
+    const int32_t tileMinZ = floorDiv16(minZ);
+    const int32_t tileMaxZ = floorDiv16(maxZ);
+
+    for (int32_t tz = tileMinZ; tz <= tileMaxZ; ++tz) {
+        for (int32_t tx = tileMinX; tx <= tileMaxX; ++tx) {
+            // Check if any chunk in chunks falls into this 16x16-chunk tile
+            bool hasChunks = false;
+            for (int cz = 0; cz < 16; ++cz) {
+                for (int cx = 0; cx < 16; ++cx) {
+                    uint64_t key = makeChunkCoordKey(tx * 16 + cx, tz * 16 + cz);
+                    if (chunks.find(key) != chunks.end()) {
+                        hasChunks = true;
+                        break;
+                    }
+                }
+                if (hasChunks) break;
+            }
+            if (!hasChunks) continue;
+
+            auto tileMesh = buildTileMesh(tx * 16, tz * 16, tier, chunks);
+            if (!tileMesh.indices.empty()) {
+                result.push_back(std::move(tileMesh));
+            }
+        }
+    }
+    return result;
 }
 
 } // namespace lod_poc

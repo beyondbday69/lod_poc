@@ -12,6 +12,7 @@
 #include <GLES3/gl3.h>
 
 #include "mod/ChunkTranslationMath.h"
+#include "mod/LodMesh.h"
 
 namespace lod_poc {
 
@@ -38,6 +39,12 @@ public:
 
     /** Update the F3 origin.  Applied on the render thread at the next frame boundary. */
     void setOriginConfig(float x, float y, float z, bool valid);
+
+    /** Receive newly generated LOD terrain meshes from WorldReader (background thread). */
+    void setLodMeshes(std::vector<LodTileMesh> &&meshes);
+
+    /** Receive discovered player world coordinates from WorldReader. */
+    void setDiscoveredPlayerPos(float x, float y, float z);
 
     void onUniformMatrix4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
     void onBindFramebufferBefore(GLuint newFbo, GLuint currentBoundFbo, uint64_t frameDraws, GLenum terrainDepthFunc, bool depthInvalidated);
@@ -170,6 +177,32 @@ private:
     GLuint mCubeVao{0};
     GLuint mCubeVbo{0};
     GLuint mCubeEbo{0};
+
+    // LOD Terrain Render resources
+    struct LodTileGlBuffer {
+        GLuint vao{0};
+        GLuint vbo{0};
+        GLuint ebo{0};
+        GLsizei indexCount{0};
+    };
+
+    std::mutex mLodMeshMutex;
+    std::vector<LodTileMesh> mPendingLodMeshes;
+    bool mHasNewLodMeshes{false};
+    std::vector<LodTileGlBuffer> mLodGlBuffers;
+    bool mLodGlInitialized{false};
+    GLuint mLodProgram{0};
+    GLint mLodLocProj{-1};
+    GLint mLodLocView{-1};
+    GLint mLodLocCameraPos{-1};
+
+    float mDiscoveredPlayerPos[3]{0.0f, 0.0f, 0.0f};
+    bool mHasDiscoveredPlayerPos{false};
+    bool mDiscoveredPosPending{false};
+
+    bool initLodGL();
+    void uploadPendingLodMeshes();
+    void drawLodTerrain(GLuint targetFbo, GLenum terrainDepthFunc);
 
     // Frame tracking
     std::atomic<bool> mDrawnThisFrame{false};

@@ -46,6 +46,16 @@ class LodMeshBuilder {
      */
     static LodTileMesh buildTileMesh(int32_t tileChunkX, int32_t tileChunkZ, int tier,
                                      const std::unordered_map<uint64_t, ChunkColumnData> &chunks);
+
+    /**
+     * @brief Builds low-poly heightfield tile meshes for all 16x16-chunk areas that contain chunks.
+     *
+     * @param tier LOD tier (1: 2x2, 2: 4x4, 3: 8x8, 4: 16x16)
+     * @param chunks Extracted Overworld chunk database
+     */
+    static std::vector<LodTileMesh> buildAllTiles(
+        int tier,
+        const std::unordered_map<uint64_t, ChunkColumnData> &chunks);
 };
 
 } // namespace lod_poc

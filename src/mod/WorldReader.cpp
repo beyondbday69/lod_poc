@@ -3,6 +3,7 @@
 #include "mod/LodMesh.h"
 #include "mod/LodPocMod.h"
 #include "mod/PngWriter.h"
+#include "mod/PocQuad.h"
 
 #include <algorithm>
 #include <atomic>
@@ -43,6 +44,61 @@ std::atomic<int> gRescanIntervalSec{0};
 bool isWorldDbFileName(std::string_view filename) {
     return filename.ends_with(".ldb") || filename.ends_with(".log") ||
            filename.starts_with("MANIFEST") || filename == "CURRENT";
+}
+
+bool readLevelDatPos(const std::filesystem::path &levelDatPath, float outPos[3]) {
+    std::error_code ec;
+    if (!std::filesystem::exists(levelDatPath, ec)) {
+        return false;
+    }
+    FILE *f = std::fopen(levelDatPath.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    long size = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (size < 16) {
+        std::fclose(f);
+        return false;
+    }
+    std::vector<uint8_t> buf(static_cast<size_t>(size));
+    size_t readBytes = std::fread(buf.data(), 1, buf.size(), f);
+    std::fclose(f);
+    if (readBytes < 16) return false;
+
+    // Search for player Pos first: TAG_List with name "Pos"
+    if (extractPlayerPos(buf.data(), buf.size(), outPos)) {
+        return true;
+    }
+
+    // Fallback: Search for SpawnX, SpawnY, SpawnZ (TAG_Int = 0x03)
+    auto findTagInt = [&](std::string_view name, int32_t &outVal) -> bool {
+        std::vector<uint8_t> pat;
+        pat.push_back(0x03); // TAG_Int
+        pat.push_back(static_cast<uint8_t>(name.size() & 0xFF));
+        pat.push_back(static_cast<uint8_t>((name.size() >> 8) & 0xFF));
+        for (char c : name) pat.push_back(static_cast<uint8_t>(c));
+        for (size_t i = 0; i + pat.size() + 4 <= buf.size(); ++i) {
+            if (std::memcmp(buf.data() + i, pat.data(), pat.size()) == 0) {
+                uint32_t raw = static_cast<uint32_t>(buf[i + pat.size()]) |
+                               (static_cast<uint32_t>(buf[i + pat.size() + 1]) << 8) |
+                               (static_cast<uint32_t>(buf[i + pat.size() + 2]) << 16) |
+                               (static_cast<uint32_t>(buf[i + pat.size() + 3]) << 24);
+                outVal = static_cast<int32_t>(raw);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    int32_t sx = 0, sy = 64, sz = 0;
+    if (findTagInt("SpawnX", sx) && findTagInt("SpawnZ", sz)) {
+        findTagInt("SpawnY", sy);
+        outPos[0] = static_cast<float>(sx);
+        outPos[1] = static_cast<float>(sy);
+        outPos[2] = static_cast<float>(sz);
+        return true;
+    }
+    return false;
 }
 
 std::string findActiveWorldDb(std::vector<std::string> &outCandidates) {
@@ -666,6 +722,57 @@ void WorldReader::runScan(const std::filesystem::path &primaryDir,
         "[LOD Reader] World Bounds: Chunk X=[{} .. {}], Chunk Z=[{} .. {}] "
         "(span: {}x{} chunks)",
         minX, maxX, minZ, maxZ, (maxX - minX + 1), (maxZ - minZ + 1));
+
+    // 1. Resolve player / world position
+    float resolvedPlayerPos[3]{0.0f, 68.0f, 0.0f};
+    bool hasOrigin = false;
+    const char *originSource = "none";
+
+    if (state.hasPlayerPos) {
+        resolvedPlayerPos[0] = state.playerPos[0];
+        resolvedPlayerPos[1] = state.playerPos[1];
+        resolvedPlayerPos[2] = state.playerPos[2];
+        hasOrigin = true;
+        originSource = "LevelDB (~local_player)";
+    } else {
+        std::filesystem::path levelDatPath = std::filesystem::path(dbDir).parent_path() / "level.dat";
+        if (readLevelDatPos(levelDatPath, resolvedPlayerPos)) {
+            hasOrigin = true;
+            originSource = "level.dat";
+        } else {
+            // Fallback: World bounds center
+            resolvedPlayerPos[0] = static_cast<float>((minX + maxX) * 8);
+            resolvedPlayerPos[1] = 68.0f;
+            resolvedPlayerPos[2] = static_cast<float>((minZ + maxZ) * 8);
+            hasOrigin = true;
+            originSource = "world chunk bounds center";
+        }
+    }
+
+    if (hasOrigin) {
+        LodPocMod::logAll(
+            LogLevel::Info,
+            "[LOD Reader] Resolved player world origin: ({:.2f}, {:.2f}, {:.2f}) (source: {})",
+            resolvedPlayerPos[0], resolvedPlayerPos[1], resolvedPlayerPos[2], originSource);
+        PocQuad::instance().setDiscoveredPlayerPos(resolvedPlayerPos[0], resolvedPlayerPos[1], resolvedPlayerPos[2]);
+    }
+
+    // 2. Build all LOD terrain tiles and send to GPU
+    auto allMeshes = LodMeshBuilder::buildAllTiles(2, state.chunks);
+    size_t totalTiles = allMeshes.size();
+    size_t totalVerts = 0;
+    size_t totalIndices = 0;
+    size_t totalMem = 0;
+    for (const auto &m : allMeshes) {
+        totalVerts += m.vertices.size();
+        totalIndices += m.indices.size();
+        totalMem += m.memoryBytes();
+    }
+    PocQuad::instance().setLodMeshes(std::move(allMeshes));
+    LodPocMod::logAll(
+        LogLevel::Info,
+        "[LOD Mesh] Built {} LOD terrain tiles: {} verts, {} indices, memory: {:.2f} KB -> sent to GPU",
+        totalTiles, totalVerts, totalIndices, static_cast<double>(totalMem) / 1024.0);
 
     const int32_t sampleTileX = floorDiv16(minX);
     const int32_t sampleTileZ = floorDiv16(minZ);

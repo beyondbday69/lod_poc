@@ -338,7 +338,48 @@ PocQuad::FrameMatrixStats PocQuad::endMatrixFrame() {
     return stats;
 }
 
+void PocQuad::setLodMeshes(std::vector<LodTileMesh> &&meshes) {
+    std::lock_guard lock(mLodMeshMutex);
+    mPendingLodMeshes = std::move(meshes);
+    mHasNewLodMeshes = true;
+    LodPocMod::logAll(LogLevel::Info,
+        "[PocQuad: LOD] Queued {} LOD terrain tiles for GPU upload",
+        mPendingLodMeshes.size());
+}
+
+void PocQuad::setDiscoveredPlayerPos(float x, float y, float z) {
+    std::lock_guard lock(mConfigMutex);
+    mDiscoveredPlayerPos[0] = x;
+    mDiscoveredPlayerPos[1] = y;
+    mDiscoveredPlayerPos[2] = z;
+    mHasDiscoveredPlayerPos = true;
+    mDiscoveredPosPending = true;
+    LodPocMod::logAll(LogLevel::Info,
+        "[PocQuad: Origin] Received discovered player world position: ({:.2f}, {:.2f}, {:.2f})",
+        x, y, z);
+}
+
 void PocQuad::applyPendingOrigin() {
+    if (!mOriginValid && mDiscoveredPosPending) {
+        mDiscoveredPosPending = false;
+        mOriginX = mDiscoveredPlayerPos[0];
+        mOriginY = mDiscoveredPlayerPos[1];
+        mOriginZ = mDiscoveredPlayerPos[2];
+        mTrackedCameraPos[0] = mOriginX;
+        mTrackedCameraPos[1] = mOriginY + 1.620f;
+        mTrackedCameraPos[2] = mOriginZ;
+        mAutoOrigin = false;
+        mCameraTracked = true;
+        mSignDetected = true;
+        mTranslationSign = -1.0f;
+        mTrackerPrimed = false;
+        mPreviousTranslations.clear();
+        mCubeAnchored = false;
+        LodPocMod::logAll(LogLevel::Info,
+            "[PocQuad: Origin] Auto-calibrated camera to discovered world origin: ({:.4f}, {:.4f}, {:.4f}) with eyeHeight=+1.62",
+            mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2]);
+    }
+
     OriginRequest request;
     {
         std::lock_guard lock(mOriginMutex);
@@ -899,6 +940,183 @@ void PocQuad::computeCubeModelOffset(float out[3]) const {
     }
 }
 
+bool PocQuad::initLodGL() {
+    const char *vsSource =
+        "#version 300 es\n"
+        "layout(location = 0) in vec3 aPos;\n"
+        "layout(location = 1) in vec4 aColor;\n"
+        "uniform mat4 uProj;\n"
+        "uniform mat4 uView;\n"
+        "uniform vec3 uCameraPos;\n"
+        "out vec3 vWorldPos;\n"
+        "out vec4 vColor;\n"
+        "void main() {\n"
+        "    vec3 relPos = aPos - uCameraPos;\n"
+        "    vec4 eyePos = uView * vec4(relPos, 1.0);\n"
+        "    gl_Position = uProj * eyePos;\n"
+        "    vWorldPos = aPos;\n"
+        "    vColor = aColor;\n"
+        "}\n";
+
+    const char *fsSource =
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "in vec3 vWorldPos;\n"
+        "in vec4 vColor;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec3 dX = dFdx(vWorldPos);\n"
+        "    vec3 dY = dFdy(vWorldPos);\n"
+        "    vec3 normal = normalize(cross(dX, dY));\n"
+        "    if (normal.y < 0.0) normal = -normal;\n"
+        "    vec3 lightDir = normalize(vec3(0.4, 0.9, 0.3));\n"
+        "    float diff = max(dot(normal, lightDir), 0.55);\n"
+        "    fragColor = vec4(vColor.rgb * diff, 1.0);\n"
+        "}\n";
+
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &vsSource, nullptr);
+    glCompileShader(vs);
+    GLint status = 0;
+    glGetShaderiv(vs, GL_COMPILE_STATUS, &status);
+    if (!status) {
+        char log[512];
+        glGetShaderInfoLog(vs, sizeof(log), nullptr, log);
+        LodPocMod::logAll(LogLevel::Error, "[PocQuad: LOD] Failed to compile LOD VS: {}", log);
+        glDeleteShader(vs);
+        return false;
+    }
+
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &fsSource, nullptr);
+    glCompileShader(fs);
+    glGetShaderiv(fs, GL_COMPILE_STATUS, &status);
+    if (!status) {
+        char log[512];
+        glGetShaderInfoLog(fs, sizeof(log), nullptr, log);
+        LodPocMod::logAll(LogLevel::Error, "[PocQuad: LOD] Failed to compile LOD FS: {}", log);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        return false;
+    }
+
+    mLodProgram = glCreateProgram();
+    glAttachShader(mLodProgram, vs);
+    glAttachShader(mLodProgram, fs);
+    glLinkProgram(mLodProgram);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    glGetProgramiv(mLodProgram, GL_LINK_STATUS, &status);
+    if (!status) {
+        char log[512];
+        glGetProgramInfoLog(mLodProgram, sizeof(log), nullptr, log);
+        LodPocMod::logAll(LogLevel::Error, "[PocQuad: LOD] Failed to link LOD program: {}", log);
+        glDeleteProgram(mLodProgram);
+        mLodProgram = 0;
+        return false;
+    }
+
+    mLodLocProj = glGetUniformLocation(mLodProgram, "uProj");
+    mLodLocView = glGetUniformLocation(mLodProgram, "uView");
+    mLodLocCameraPos = glGetUniformLocation(mLodProgram, "uCameraPos");
+
+    mLodGlInitialized = true;
+    LodPocMod::logAll(LogLevel::Info,
+        "[PocQuad: LOD] Initialized LOD terrain program ({}) successfully",
+        mLodProgram);
+    return true;
+}
+
+void PocQuad::uploadPendingLodMeshes() {
+    std::vector<LodTileMesh> pending;
+    {
+        std::lock_guard lock(mLodMeshMutex);
+        if (!mHasNewLodMeshes) return;
+        pending = std::move(mPendingLodMeshes);
+        mHasNewLodMeshes = false;
+    }
+
+    if (pending.empty()) return;
+
+    for (auto &buf : mLodGlBuffers) {
+        if (buf.vao != 0) glDeleteVertexArrays(1, &buf.vao);
+        if (buf.vbo != 0) glDeleteBuffers(1, &buf.vbo);
+        if (buf.ebo != 0) glDeleteBuffers(1, &buf.ebo);
+    }
+    mLodGlBuffers.clear();
+
+    size_t totalVerts = 0;
+    size_t totalIndices = 0;
+
+    for (const auto &tile : pending) {
+        if (tile.indices.empty()) continue;
+
+        LodTileGlBuffer buf;
+        glGenVertexArrays(1, &buf.vao);
+        glBindVertexArray(buf.vao);
+
+        glGenBuffers(1, &buf.vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, buf.vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(tile.vertices.size() * sizeof(LodVertex)),
+                     tile.vertices.data(), GL_STATIC_DRAW);
+
+        glGenBuffers(1, &buf.ebo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buf.ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(tile.indices.size() * sizeof(uint32_t)),
+                     tile.indices.data(), GL_STATIC_DRAW);
+
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(LodVertex),
+                              reinterpret_cast<const void *>(offsetof(LodVertex, x)));
+
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(LodVertex),
+                              reinterpret_cast<const void *>(offsetof(LodVertex, r)));
+
+        buf.indexCount = static_cast<GLsizei>(tile.indices.size());
+        mLodGlBuffers.push_back(buf);
+
+        totalVerts += tile.vertices.size();
+        totalIndices += tile.indices.size();
+    }
+
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
+    LodPocMod::logAll(LogLevel::Info,
+        "[PocQuad: LOD] Uploaded {} LOD terrain tiles to GPU (total verts: {}, indices: {}, memory: {:.2f} KB)",
+        mLodGlBuffers.size(), totalVerts, totalIndices,
+        static_cast<double>(totalVerts * sizeof(LodVertex) + totalIndices * sizeof(uint32_t)) / 1024.0);
+}
+
+void PocQuad::drawLodTerrain(GLuint targetFbo, GLenum terrainDepthFunc) {
+    (void)targetFbo;
+    (void)terrainDepthFunc;
+
+    uploadPendingLodMeshes();
+    if (mLodGlBuffers.empty()) return;
+
+    if (!mLodGlInitialized) {
+        if (!initLodGL()) return;
+    }
+
+    glDisable(GL_CULL_FACE);
+    glUseProgram(mLodProgram);
+    glUniformMatrix4fv(mLodLocProj, 1, GL_FALSE, mProjMatrix);
+    glUniformMatrix4fv(mLodLocView, 1, GL_FALSE, mViewMatrix);
+    glUniform3f(mLodLocCameraPos, mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2]);
+
+    for (const auto &buf : mLodGlBuffers) {
+        glBindVertexArray(buf.vao);
+        glDrawElements(GL_TRIANGLES, buf.indexCount, GL_UNSIGNED_INT, nullptr);
+    }
+    glBindVertexArray(0);
+}
+
 void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
     if (!mInWorld.load(std::memory_order_relaxed)) return;
     if (!mEnabled.load(std::memory_order_relaxed) || mKilled.load(std::memory_order_relaxed)) return;
@@ -1053,13 +1271,22 @@ void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
     glDisable(GL_STENCIL_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-    glUseProgram(mCubeProgram);
-    glUniformMatrix4fv(mCubeLocProj, 1, GL_FALSE, mProjMatrix);
-    glUniformMatrix4fv(mCubeLocView, 1, GL_FALSE, mViewMatrix);
-    glUniform3f(mCubeLocModelOffset, modelOffset[0], modelOffset[1], modelOffset[2]);
+    // --- DRAW LOD TERRAIN MESH FIRST ---
+    drawLodTerrain(targetFbo, mLastDepthFuncUsed);
 
-    glBindVertexArray(mCubeVao);
-    glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+    // --- DRAW 3D TEST CUBE ---
+    if (mPoc3d.load(std::memory_order_relaxed)) {
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
+        glFrontFace(GL_CCW);
+        glUseProgram(mCubeProgram);
+        glUniformMatrix4fv(mCubeLocProj, 1, GL_FALSE, mProjMatrix);
+        glUniformMatrix4fv(mCubeLocView, 1, GL_FALSE, mViewMatrix);
+        glUniform3f(mCubeLocModelOffset, modelOffset[0], modelOffset[1], modelOffset[2]);
+
+        glBindVertexArray(mCubeVao);
+        glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+    }
 
     // --- RESTORE ALL TOUCHED GL STATE ---
     glBindVertexArray(static_cast<GLuint>(origVao));
@@ -1435,6 +1662,18 @@ void PocQuad::onWorldFrame(bool inWorld, double currentFps, uint64_t frameCount)
 }
 
 void PocQuad::cleanup() {
+    if (mLodProgram != 0) {
+        glDeleteProgram(mLodProgram);
+        mLodProgram = 0;
+    }
+    for (auto &buf : mLodGlBuffers) {
+        if (buf.vao != 0) glDeleteVertexArrays(1, &buf.vao);
+        if (buf.vbo != 0) glDeleteBuffers(1, &buf.vbo);
+        if (buf.ebo != 0) glDeleteBuffers(1, &buf.ebo);
+    }
+    mLodGlBuffers.clear();
+    mLodGlInitialized = false;
+
     if (mCubeInitialized) {
         if (mCubeEbo != 0) {
             glDeleteBuffers(1, &mCubeEbo);

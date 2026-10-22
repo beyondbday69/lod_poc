@@ -14,6 +14,13 @@ struct RGB {
     uint8_t r{128};
     uint8_t g{128};
     uint8_t b{128};
+
+    bool operator==(const RGB &o) const {
+        return r == o.r && g == o.g && b == o.b;
+    }
+    bool operator!=(const RGB &o) const {
+        return !(*this == o);
+    }
 };
 
 constexpr RGB kUnresolvedColor{64, 64, 64};
@@ -151,7 +158,15 @@ struct ScanState {
     std::unordered_map<std::string, PendingRecord> records;
     std::unordered_map<uint64_t, ChunkColumnData> chunks;
     ScanStats stats;
+    bool hasPlayerPos{false};
+    float playerPos[3]{0.0f, 0.0f, 0.0f};
 };
+
+/**
+ * @brief Attempts to extract 3D world player coordinates from an uncompressed NBT buffer
+ * (e.g. Bedrock ~local_player or level.dat).
+ */
+bool extractPlayerPos(const uint8_t *val, size_t len, float pos[3]);
 
 /**
  * @brief Standalone LevelDB SSTable (.ldb) reader for Minecraft Bedrock.

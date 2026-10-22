@@ -43,6 +43,52 @@ inline uint64_t readLe64(const uint8_t *p) {
            (static_cast<uint64_t>(readLe32(p + 4)) << 32);
 }
 
+inline float readLeFloat(const uint8_t *p) {
+    uint32_t u = readLe32(p);
+    float f{0.0f};
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+inline double readLeDouble(const uint8_t *p) {
+    uint64_t u = readLe64(p);
+    double d{0.0};
+    std::memcpy(&d, &u, sizeof(d));
+    return d;
+}
+
+} // namespace
+
+bool extractPlayerPos(const uint8_t *val, size_t len, float pos[3]) {
+    // Bedrock NBT for "Pos" list:
+    // TAG_List (9), name length 3 (0x03, 0x00), "Pos" (0x50, 0x6F, 0x73)
+    const uint8_t pattern[] = {0x09, 0x03, 0x00, 'P', 'o', 's'};
+    for (size_t i = 0; i + sizeof(pattern) + 5 <= len; ++i) {
+        if (std::memcmp(val + i, pattern, sizeof(pattern)) == 0) {
+            size_t p = i + sizeof(pattern);
+            uint8_t elemType = val[p++];
+            uint32_t count = readLe32(val + p);
+            p += 4;
+            if (count == 3) {
+                if (elemType == 5 && p + 12 <= len) { // TAG_Float
+                    pos[0] = readLeFloat(val + p);
+                    pos[1] = readLeFloat(val + p + 4);
+                    pos[2] = readLeFloat(val + p + 8);
+                    return true;
+                } else if (elemType == 6 && p + 24 <= len) { // TAG_Double
+                    pos[0] = static_cast<float>(readLeDouble(val + p));
+                    pos[1] = static_cast<float>(readLeDouble(val + p + 8));
+                    pos[2] = static_cast<float>(readLeDouble(val + p + 16));
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+namespace {
+
 inline bool readVarint32(const uint8_t *&ptr, const uint8_t *limit, uint32_t &val) {
     val = 0;
     int shift = 0;
@@ -1181,6 +1227,17 @@ bool LdbReader::readLdbFile(const std::string &filePath, uint64_t fileNumber,
                     if (!parseInternalKey(internalKey, userKey, sequence,
                                           valueType)) {
                         state.stats.ignoredOtherRecords++;
+                        return true;
+                    }
+
+                    if (userKey == "~local_player" && valueType == 1) {
+                        float pos[3]{0.0f, 0.0f, 0.0f};
+                        if (extractPlayerPos(value, valueLength, pos)) {
+                            state.hasPlayerPos = true;
+                            state.playerPos[0] = pos[0];
+                            state.playerPos[1] = pos[1];
+                            state.playerPos[2] = pos[2];
+                        }
                         return true;
                     }
 
