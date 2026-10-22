@@ -246,27 +246,30 @@ void LodPocMod::removeProbes() {
     mOriginalCull = nullptr;
 }
 
-void LodPocMod::lightingTaskDetour(void *context) {
+void LodPocMod::lightingTaskDetour(void *a0, void *a1, void *a2, void *a3,
+                                   void *a4, void *a5, void *a6, void *a7) {
     auto &mod = LodPocMod::instance();
     auto &self = mod.getSelf();
 
-    // Call original first
-    if (mod.mOriginalLightingTask) {
-        mod.mOriginalLightingTask(context);
+    // Read the 4 qwords from context (a0) BEFORE calling original
+    uint64_t q[4] = {0, 0, 0, 0};
+    if (a0 != nullptr) {
+        std::memcpy(q, a0, sizeof(q));
+    }
+
+    // Call original forwarding all 8 args
+    const auto orig = mod.mOriginalLightingTask;
+    if (orig) {
+        orig(a0, a1, a2, a3, a4, a5, a6, a7);
     }
 
     const uint64_t call = ++mod.mLightingCalls;
     const pid_t tid = getThreadId();
 
-    uint64_t q[4] = {0, 0, 0, 0};
-    if (context != nullptr) {
-        std::memcpy(q, context, sizeof(q));
-    }
-
     if (call <= 20) {
         self.getLogger().info(
             "[Probe 1: lightingTask] #{} tid={} ctx={:p} [0x{:016x}, 0x{:016x}, 0x{:016x}, 0x{:016x}]",
-            call, tid, context, q[0], q[1], q[2], q[3]);
+            call, tid, a0, q[0], q[1], q[2], q[3]);
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -290,8 +293,9 @@ void LodPocMod::bindFramebufferDetour(GLenum target, GLuint framebuffer) {
     auto &self = mod.getSelf();
 
     // Call original first
-    if (mod.mOriginalBindFramebuffer) {
-        mod.mOriginalBindFramebuffer(target, framebuffer);
+    const auto orig = mod.mOriginalBindFramebuffer;
+    if (orig) {
+        orig(target, framebuffer);
     }
 
     const uint64_t call = ++mod.mBindCalls;
@@ -314,9 +318,8 @@ EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
     auto &self = mod.getSelf();
 
     // Call original first
-    const EGLBoolean res = mod.mOriginalSwapBuffers
-                               ? mod.mOriginalSwapBuffers(dpy, surf)
-                               : EGL_TRUE;
+    const auto orig = mod.mOriginalSwapBuffers;
+    const EGLBoolean res = orig ? orig(dpy, surf) : EGL_TRUE;
 
     const uint64_t frame = ++mod.mFrameCount;
     const pid_t tid = getThreadId();
@@ -367,43 +370,50 @@ EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
     return res;
 }
 
-void *LodPocMod::cullPointOrChunkDetour(void *thisPtr, void *a1, void *a2, void *a3) {
+void *LodPocMod::cullPointOrChunkDetour(void *a0, void *a1, void *a2, void *a3,
+                                        void *a4, void *a5, void *a6, void *a7) {
     auto &mod = LodPocMod::instance();
     auto &self = mod.getSelf();
 
-    // Call original first
-    void *const res = mod.mOriginalCull
-                          ? mod.mOriginalCull(thisPtr, a1, a2, a3)
+    // Call original first forwarding all 8 args
+    const auto orig = mod.mOriginalCull;
+    void *const res = orig
+                          ? orig(a0, a1, a2, a3, a4, a5, a6, a7)
                           : nullptr;
 
     const uint64_t call = ++mod.mCullCalls;
-    const pid_t tid = getThreadId();
 
-    Vec3 pos{0.0f, 0.0f, 0.0f};
-    Vec3 dir{0.0f, 0.0f, 0.0f};
-    if (thisPtr != nullptr) {
-        std::memcpy(&pos, reinterpret_cast<const char *>(thisPtr) + 0x5c8, sizeof(Vec3));
-        std::memcpy(&dir, reinterpret_cast<const char *>(thisPtr) + 0x5d4, sizeof(Vec3));
-    }
+    // Optimization: only process telemetry on first 20 calls or every 4096 calls
+    if (call <= 20 || (call % 4096 == 0)) {
+        const void *thisPtr = a0;
+        Vec3 pos{0.0f, 0.0f, 0.0f};
+        Vec3 dir{0.0f, 0.0f, 0.0f};
+        if (thisPtr != nullptr) {
+            std::memcpy(&pos, reinterpret_cast<const char *>(thisPtr) + 0x5c8, sizeof(Vec3));
+            std::memcpy(&dir, reinterpret_cast<const char *>(thisPtr) + 0x5d4, sizeof(Vec3));
+        }
 
-    if (call <= 20) {
-        self.getLogger().info(
-            "[Probe 5: cullPointOrChunk] #{} tid={} this={:p} pos=({:.2f}, {:.2f}, {:.2f}) dir=({:.2f}, {:.2f}, {:.2f})",
-            call, tid, thisPtr, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z);
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - mod.mLastCullReport >= std::chrono::seconds(5)) {
-        std::lock_guard lock(mod.mCullMutex);
-        if (now - mod.mLastCullReport >= std::chrono::seconds(5)) {
-            const double sec = std::chrono::duration<double>(now - mod.mLastCullReport).count();
-            const uint64_t prev = mod.mLastCullCalls.load(std::memory_order_relaxed);
-            mod.mLastCullCalls.store(call, std::memory_order_relaxed);
-            mod.mLastCullReport = now;
-            const double rate = (sec > 0.0) ? (static_cast<double>(call - prev) / sec) : 0.0;
+        if (call <= 20) {
+            const pid_t tid = getThreadId();
             self.getLogger().info(
-                "[Probe 5: cullPointOrChunk] 5s Summary: calls={}, rate={:.1f}/s, tid={}, pos=({:.2f}, {:.2f}, {:.2f}) dir=({:.2f}, {:.2f}, {:.2f})",
-                call, rate, tid, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z);
+                "[Probe 5: cullPointOrChunk] #{} tid={} this={:p} pos=({:.2f}, {:.2f}, {:.2f}) dir=({:.2f}, {:.2f}, {:.2f})",
+                call, tid, thisPtr, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z);
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now - mod.mLastCullReport >= std::chrono::seconds(5)) {
+            std::lock_guard lock(mod.mCullMutex);
+            if (now - mod.mLastCullReport >= std::chrono::seconds(5)) {
+                const pid_t tid = getThreadId();
+                const double sec = std::chrono::duration<double>(now - mod.mLastCullReport).count();
+                const uint64_t prev = mod.mLastCullCalls.load(std::memory_order_relaxed);
+                mod.mLastCullCalls.store(call, std::memory_order_relaxed);
+                mod.mLastCullReport = now;
+                const double rate = (sec > 0.0) ? (static_cast<double>(call - prev) / sec) : 0.0;
+                self.getLogger().info(
+                    "[Probe 5: cullPointOrChunk] 5s Summary: calls={}, rate={:.1f}/s, tid={}, pos=({:.2f}, {:.2f}, {:.2f}) dir=({:.2f}, {:.2f}, {:.2f})",
+                    call, rate, tid, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z);
+            }
         }
     }
 

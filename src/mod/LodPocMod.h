@@ -44,10 +44,12 @@ class LodPocMod {
     bool unload();
 
   private:
-    using ChunkLightingTaskFn = void (*)(void *context);
+    using ChunkLightingTaskFn = void (*)(void *a0, void *a1, void *a2, void *a3,
+                                         void *a4, void *a5, void *a6, void *a7);
     using BindFramebufferFn = void (*)(GLenum target, GLuint framebuffer);
     using EglSwapBuffersFn = EGLBoolean (*)(EGLDisplay dpy, EGLSurface surf);
-    using CullPointOrChunkFn = void *(*)(void *thisPtr, void *a1, void *a2, void *a3);
+    using CullPointOrChunkFn = void *(*)(void *a0, void *a1, void *a2, void *a3,
+                                         void *a4, void *a5, void *a6, void *a7);
 
     // Lifecycle & Config
     ll::mod::NativeMod &mSelf;
@@ -90,10 +92,12 @@ class LodPocMod {
     void removeProbes();
 
     // Detours
-    static void lightingTaskDetour(void *context);
+    static void lightingTaskDetour(void *a0, void *a1, void *a2, void *a3,
+                                   void *a4, void *a5, void *a6, void *a7);
     static void bindFramebufferDetour(GLenum target, GLuint framebuffer);
     static EGLBoolean swapBuffersDetour(EGLDisplay dpy, EGLSurface surf);
-    static void *cullPointOrChunkDetour(void *thisPtr, void *a1, void *a2, void *a3);
+    static void *cullPointOrChunkDetour(void *a0, void *a1, void *a2, void *a3,
+                                        void *a4, void *a5, void *a6, void *a7);
 };
 
 } // namespace lod_poc
