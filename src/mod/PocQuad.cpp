@@ -1,6 +1,7 @@
 #include "mod/PocQuad.h"
 #include "mod/LodPocMod.h"
 
+#include <dlfcn.h>
 #include <algorithm>
 #include <sstream>
 
@@ -9,6 +10,37 @@ namespace lod_poc {
 namespace {
 
 thread_local bool sInsideQuadRender = false;
+
+using PFN_glGetIntegeri_v = void (*)(GLenum target, GLuint index, GLint *data);
+using PFN_glGetInteger64i_v = void (*)(GLenum target, GLuint index, GLint64 *data);
+using PFN_glBindBufferRange = void (*)(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size);
+using PFN_glBindBufferBase = void (*)(GLenum target, GLuint index, GLuint buffer);
+
+static PFN_glGetIntegeri_v sGetIntegeri_v = nullptr;
+static PFN_glGetInteger64i_v sGetInteger64i_v = nullptr;
+static PFN_glBindBufferRange sBindBufferRange = nullptr;
+static PFN_glBindBufferBase sBindBufferBase = nullptr;
+static bool sUboFunctionsResolved = false;
+
+static void resolveUboFunctions() {
+    if (sUboFunctionsResolved) return;
+    sUboFunctionsResolved = true;
+
+    void *glesLib = dlopen("libGLESv3.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!glesLib) glesLib = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
+
+    auto lookup = [glesLib](const char *name) -> void * {
+        void *sym = nullptr;
+        if (glesLib) sym = dlsym(glesLib, name);
+        if (!sym) sym = dlsym(RTLD_DEFAULT, name);
+        return sym;
+    };
+
+    sGetIntegeri_v = reinterpret_cast<PFN_glGetIntegeri_v>(lookup("glGetIntegeri_v"));
+    sGetInteger64i_v = reinterpret_cast<PFN_glGetInteger64i_v>(lookup("glGetInteger64i_v"));
+    sBindBufferRange = reinterpret_cast<PFN_glBindBufferRange>(lookup("glBindBufferRange"));
+    sBindBufferBase = reinterpret_cast<PFN_glBindBufferBase>(lookup("glBindBufferBase"));
+}
 
 std::array<float, 4> parseHexColor(const std::string &hex) {
     std::string s = hex;
@@ -214,10 +246,13 @@ void PocQuad::drawQuad(GLuint targetFbo, GLenum terrainDepthFunc, bool depthInva
     GLint origUbos[4] = {0};
     GLint64 origUboOffsets[4] = {0};
     GLint64 origUboSizes[4] = {0};
-    for (GLuint i = 0; i < 4; ++i) {
-        glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, i, &origUbos[i]);
-        glGetInteger64i_v(GL_UNIFORM_BUFFER_START, i, &origUboOffsets[i]);
-        glGetInteger64i_v(GL_UNIFORM_BUFFER_SIZE, i, &origUboSizes[i]);
+    resolveUboFunctions();
+    if (sGetIntegeri_v != nullptr && sGetInteger64i_v != nullptr) {
+        for (GLuint i = 0; i < 4; ++i) {
+            sGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, i, &origUbos[i]);
+            sGetInteger64i_v(GL_UNIFORM_BUFFER_START, i, &origUboOffsets[i]);
+            sGetInteger64i_v(GL_UNIFORM_BUFFER_SIZE, i, &origUboSizes[i]);
+        }
     }
 
     GLint origViewport[4] = {0};
@@ -297,13 +332,15 @@ void PocQuad::drawQuad(GLuint targetFbo, GLenum terrainDepthFunc, bool depthInva
     glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(origVbo));
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(origEbo));
 
-    for (GLuint i = 0; i < 4; ++i) {
-        if (origUbos[i] != 0 && origUboSizes[i] > 0) {
-            glBindBufferRange(GL_UNIFORM_BUFFER, i, static_cast<GLuint>(origUbos[i]),
-                              static_cast<GLintptr>(origUboOffsets[i]),
-                              static_cast<GLsizeiptr>(origUboSizes[i]));
-        } else {
-            glBindBufferBase(GL_UNIFORM_BUFFER, i, static_cast<GLuint>(origUbos[i]));
+    if (sBindBufferRange != nullptr && sBindBufferBase != nullptr) {
+        for (GLuint i = 0; i < 4; ++i) {
+            if (origUbos[i] != 0 && origUboSizes[i] > 0) {
+                sBindBufferRange(GL_UNIFORM_BUFFER, i, static_cast<GLuint>(origUbos[i]),
+                                 static_cast<GLintptr>(origUboOffsets[i]),
+                                 static_cast<GLsizeiptr>(origUboSizes[i]));
+            } else {
+                sBindBufferBase(GL_UNIFORM_BUFFER, i, static_cast<GLuint>(origUbos[i]));
+            }
         }
     }
 

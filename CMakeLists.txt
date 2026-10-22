@@ -106,7 +106,12 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/out/${CMAKE_ANDROID_ARCH
 
 find_library(LL_LOG_LIB log REQUIRED)
 find_library(LL_EGL_LIB EGL REQUIRED)
-find_library(LL_GLES_LIB GLESv2 REQUIRED)
+find_library(LL_GLES3_LIB GLESv3)
+if(LL_GLES3_LIB)
+    set(LL_GLES_LIB ${LL_GLES3_LIB})
+else()
+    find_library(LL_GLES_LIB GLESv2 REQUIRED)
+endif()
 find_library(LL_Z_LIB z REQUIRED)
 
 add_library(${MOD_LIBRARY_NAME} SHARED
