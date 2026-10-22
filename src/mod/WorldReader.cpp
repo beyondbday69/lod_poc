@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <dirent.h>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <string>
@@ -181,7 +182,7 @@ orderedChunks(const std::unordered_map<uint64_t, ChunkColumnData> &chunks) {
     return ordered;
 }
 
-void logWorldScanStats(const LdbReader::ScanState &state) {
+void logWorldScanStats(const ScanState &state) {
     const auto &stats = state.stats;
 
     LodPocMod::logAll(
@@ -404,106 +405,106 @@ void WorldReader::startBackgroundScan(const std::filesystem::path &primaryDir,
     try {
         std::thread([primaryDir]() {
             try {
-            std::vector<std::string> candidates;
-            std::string dbDir;
+                std::vector<std::string> candidates;
+                std::string dbDir;
 
-            const auto startedAt = Clock::now();
-            auto lastWaitLog = startedAt;
+                const auto startedAt = Clock::now();
+                auto lastWaitLog = startedAt;
 
-            LodPocMod::logAll(
-                LogLevel::Info,
-                "[LOD Reader] waiting for world... polling /proc/self/fd "
-                "every 3s (timeout 15 min)");
+                LodPocMod::logAll(
+                    LogLevel::Info,
+                    "[LOD Reader] waiting for world... polling /proc/self/fd "
+                    "every 3s (timeout 15 min)");
 
-            while (true) {
-                candidates.clear();
-                dbDir = findActiveWorldDb(candidates);
-                if (!dbDir.empty()) {
-                    break;
-                }
-
-                const auto now = Clock::now();
-                if (now - startedAt >= kWaitTimeout) {
-                    LodPocMod::logAll(
-                        LogLevel::Warn,
-                        "[LOD Reader] Timed out after 15 minutes waiting for "
-                        "world... (candidate DBs={})",
-                        candidates.size());
-                    gRunning.store(false);
-                    return;
-                }
-
-                if (now - lastWaitLog >= kWaitLogInterval) {
-                    const auto elapsedSeconds =
-                        std::chrono::duration_cast<std::chrono::seconds>(
-                            now - startedAt)
-                            .count();
-                    LodPocMod::logAll(
-                        LogLevel::Info,
-                        "[LOD Reader] waiting for world... elapsed={}s "
-                        "candidate DBs={}",
-                        elapsedSeconds, candidates.size());
-                    lastWaitLog = now;
-                }
-
-                std::this_thread::sleep_for(kPollInterval);
-            }
-
-            LodPocMod::logAll(
-                LogLevel::Info,
-                "[LOD Reader] Discovered active world DB directory: {}",
-                dbDir);
-
-            runScan(primaryDir, dbDir);
-
-            while (true) {
-                int interval = gRescanIntervalSec.load();
-                if (interval <= 0) {
-                    break;
-                }
-
-                auto nextRescan = Clock::now() + std::chrono::seconds(interval);
-                while (Clock::now() < nextRescan) {
-                    std::this_thread::sleep_for(kRescanSleepSlice);
-                    const int updated = gRescanIntervalSec.load();
-                    if (updated <= 0) {
-                        interval = 0;
+                while (true) {
+                    candidates.clear();
+                    dbDir = findActiveWorldDb(candidates);
+                    if (!dbDir.empty()) {
                         break;
                     }
-                    if (updated != interval) {
-                        interval = updated;
-                        nextRescan = Clock::now() + std::chrono::seconds(interval);
+
+                    const auto now = Clock::now();
+                    if (now - startedAt >= kWaitTimeout) {
+                        LodPocMod::logAll(
+                            LogLevel::Warn,
+                            "[LOD Reader] Timed out after 15 minutes waiting for "
+                            "world... (candidate DBs={})",
+                            candidates.size());
+                        gRunning.store(false);
+                        return;
                     }
+
+                    if (now - lastWaitLog >= kWaitLogInterval) {
+                        const auto elapsedSeconds =
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                now - startedAt)
+                                .count();
+                        LodPocMod::logAll(
+                            LogLevel::Info,
+                            "[LOD Reader] waiting for world... elapsed={}s "
+                            "candidate DBs={}",
+                            elapsedSeconds, candidates.size());
+                        lastWaitLog = now;
+                    }
+
+                    std::this_thread::sleep_for(kPollInterval);
                 }
 
-                if (interval <= 0 || gRescanIntervalSec.load() <= 0) {
-                    break;
+                LodPocMod::logAll(
+                    LogLevel::Info,
+                    "[LOD Reader] Discovered active world DB directory: {}",
+                    dbDir);
+
+                WorldReader::runScan(primaryDir, dbDir);
+
+                while (true) {
+                    int interval = gRescanIntervalSec.load();
+                    if (interval <= 0) {
+                        break;
+                    }
+
+                    auto nextRescan = Clock::now() + std::chrono::seconds(interval);
+                    while (Clock::now() < nextRescan) {
+                        std::this_thread::sleep_for(kRescanSleepSlice);
+                        const int updated = gRescanIntervalSec.load();
+                        if (updated <= 0) {
+                            interval = 0;
+                            break;
+                        }
+                        if (updated != interval) {
+                            interval = updated;
+                            nextRescan = Clock::now() + std::chrono::seconds(interval);
+                        }
+                    }
+
+                    if (interval <= 0 || gRescanIntervalSec.load() <= 0) {
+                        break;
+                    }
+
+                    std::vector<std::string> rescannedCandidates;
+                    const std::string newDbDir =
+                        findActiveWorldDb(rescannedCandidates);
+                    if (newDbDir.empty()) {
+                        LodPocMod::logAll(
+                            LogLevel::Warn,
+                            "[LOD Reader] World DB is no longer open; stopping "
+                            "rescans");
+                        break;
+                    }
+
+                    if (newDbDir != dbDir) {
+                        LodPocMod::logAll(
+                            LogLevel::Info,
+                            "[LOD Reader] Active world DB changed: {} -> {}",
+                            dbDir, newDbDir);
+                        dbDir = newDbDir;
+                    }
+
+                    WorldReader::runScan(primaryDir, dbDir);
                 }
 
-                std::vector<std::string> rescannedCandidates;
-                const std::string newDbDir =
-                    findActiveWorldDb(rescannedCandidates);
-                if (newDbDir.empty()) {
-                    LodPocMod::logAll(
-                        LogLevel::Warn,
-                        "[LOD Reader] World DB is no longer open; stopping "
-                        "rescans");
-                    break;
-                }
-
-                if (newDbDir != dbDir) {
-                    LodPocMod::logAll(
-                        LogLevel::Info,
-                        "[LOD Reader] Active world DB changed: {} -> {}",
-                        dbDir, newDbDir);
-                    dbDir = newDbDir;
-                }
-
-                runScan(primaryDir, dbDir);
-            }
-
-            LodPocMod::logAll(LogLevel::Info,
-                              "[LOD Reader] Background poller finished");
+                LodPocMod::logAll(LogLevel::Info,
+                                  "[LOD Reader] Background poller finished");
             } catch (const std::exception &ex) {
                 LodPocMod::logAll(
                     LogLevel::Error,
@@ -604,7 +605,7 @@ void WorldReader::runScan(const std::filesystem::path &primaryDir,
         "in ascending file-number order",
         ldbFiles.size(), totalMb);
 
-    LdbReader::ScanState state;
+    ScanState state;
     const auto readStarted = Clock::now();
 
     for (const LdbFile &file : ldbFiles) {
