@@ -21,8 +21,9 @@ public:
         return mEnabled.load(std::memory_order_relaxed) && !mKilled.load(std::memory_order_relaxed);
     }
 
-    void setConfig(bool enabled, float depth, const std::string &colorHex, const std::string &trigger);
+    void setConfig(bool enabled, float depth, const std::string &colorHex, const std::string &trigger, bool poc3d = true, float poc3dDist = 8.0f);
 
+    void onUniformMatrix4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
     void onBindFramebufferBefore(GLuint newFbo, GLuint currentBoundFbo, uint64_t frameDraws, GLenum terrainDepthFunc, bool depthInvalidated);
     void onClearAfter(GLbitfield mask, GLuint currentBoundFbo, uint64_t frameDraws, GLenum terrainDepthFunc);
 
@@ -37,22 +38,49 @@ private:
     bool initGL();
     void drawQuad(GLuint targetFbo, GLenum terrainDepthFunc, bool depthInvalidated);
 
+    bool initCubeGL();
+    void drawCube(GLuint targetFbo, GLenum terrainDepthFunc);
+
     std::atomic<bool> mEnabled{false};
     std::atomic<bool> mKilled{false};
     std::atomic<float> mDepth{0.5f};
+    std::atomic<bool> mPoc3d{true};
+    std::atomic<float> mPoc3dDist{8.0f};
 
     std::mutex mConfigMutex;
     std::string mColorHex{"ff00ff"};
     std::array<float, 4> mColorRgba{1.0f, 0.0f, 1.0f, 1.0f};
     std::string mTrigger{"before_fbo1"};
 
-    // Render resources (created on render thread)
+    // 2D Quad Render resources (created on render thread)
     bool mInitialized{false};
     GLuint mProgram{0};
     GLint mLocDepth{-1};
     GLint mLocColor{-1};
     GLuint mVao{0};
     GLuint mVbo{0};
+
+    // 3D Matrix & World Anchor state
+    bool mHasProjMatrix{false};
+    float mProjMatrix[16]{0};
+    bool mHasViewMatrix{false};
+    float mViewMatrix[16]{0};
+    bool mHasChunkOffset{false};
+    float mChunkOffset[3]{0, 0, 0};
+
+    bool mCubeAnchored{false};
+    float mAnchorWorldPos[3]{0, 0, 0};
+    float mAnchorChunkOffset[3]{0, 0, 0};
+
+    // 3D Cube Render resources
+    bool mCubeInitialized{false};
+    GLuint mCubeProgram{0};
+    GLint mCubeLocProj{-1};
+    GLint mCubeLocView{-1};
+    GLint mCubeLocModelOffset{-1};
+    GLuint mCubeVao{0};
+    GLuint mCubeVbo{0};
+    GLuint mCubeEbo{0};
 
     // Frame tracking
     std::atomic<bool> mDrawnThisFrame{false};

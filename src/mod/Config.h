@@ -48,6 +48,10 @@ struct ModConfig {
     float pocDepth = 0.5f;
     std::string pocColor = "ff00ff";
     std::string pocTrigger = "before_fbo1";
+
+    /** Stage 3: 3D World Cube Test */
+    bool poc3d = true;
+    float poc3dDist = 8.0f;
 };
 
 nlohmann::json makeDefaultConfigJson();

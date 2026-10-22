@@ -1221,7 +1221,17 @@ void GlTrace::detourDiscardFramebufferEXT(GLenum target, GLsizei numAttachments,
 
 void GlTrace::detourUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigUniformMatrix4fv != nullptr) inst.mOrigUniformMatrix4fv(location, count, transpose, value);
+        return;
+    }
+
     if (inst.mOrigUniformMatrix4fv != nullptr) inst.mOrigUniformMatrix4fv(location, count, transpose, value);
+
+    if (value != nullptr && count > 0) {
+        PocQuad::instance().onUniformMatrix4fv(inst.mCurrentProgram, location, count, transpose, value);
+    }
+
     if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
     if (gettid() != inst.getRenderThreadId()) return;
 
@@ -1533,6 +1543,10 @@ void GlTrace::install() {
     hookPermanent("glDepthFunc", {},
                   reinterpret_cast<void *>(&detourDepthFunc),
                   reinterpret_cast<void **>(&mOrigDepthFunc));
+
+    hookPermanent("glUniformMatrix4fv", {},
+                  reinterpret_cast<void *>(&detourUniformMatrix4fv),
+                  reinterpret_cast<void **>(&mOrigUniformMatrix4fv));
 }
 
 void GlTrace::remove() {
@@ -1544,6 +1558,7 @@ void GlTrace::remove() {
     mOrigDrawArraysInstanced = nullptr;
     mOrigClear = nullptr;
     mOrigDepthFunc = nullptr;
+    mOrigUniformMatrix4fv = nullptr;
 }
 
 void GlTrace::installHeavyHooks() {
@@ -1620,7 +1635,6 @@ void GlTrace::installHeavyHooks() {
     hookFn("glInvalidateFramebuffer", {}, reinterpret_cast<void *>(&detourInvalidateFramebuffer), reinterpret_cast<void **>(&mOrigInvalidateFramebuffer));
     hookFn("glInvalidateSubFramebuffer", {}, reinterpret_cast<void *>(&detourInvalidateSubFramebuffer), reinterpret_cast<void **>(&mOrigInvalidateSubFramebuffer));
     hookFn("glDiscardFramebufferEXT", {"glDiscardFramebufferOES"}, reinterpret_cast<void *>(&detourDiscardFramebufferEXT), reinterpret_cast<void **>(&mOrigDiscardFramebufferEXT));
-    hookFn("glUniformMatrix4fv", {}, reinterpret_cast<void *>(&detourUniformMatrix4fv), reinterpret_cast<void **>(&mOrigUniformMatrix4fv));
     hookFn("glUniform4fv", {}, reinterpret_cast<void *>(&detourUniform4fv), reinterpret_cast<void **>(&mOrigUniform4fv));
     hookFn("glBindBufferBase", {}, reinterpret_cast<void *>(&detourBindBufferBase), reinterpret_cast<void **>(&mOrigBindBufferBase));
     hookFn("glBindBufferRange", {}, reinterpret_cast<void *>(&detourBindBufferRange), reinterpret_cast<void **>(&mOrigBindBufferRange));
@@ -1662,7 +1676,6 @@ void GlTrace::removeHeavyHooks() {
     mOrigInvalidateFramebuffer = nullptr;
     mOrigInvalidateSubFramebuffer = nullptr;
     mOrigDiscardFramebufferEXT = nullptr;
-    mOrigUniformMatrix4fv = nullptr;
     mOrigUniform4fv = nullptr;
     mOrigBindBufferBase = nullptr;
     mOrigBindBufferRange = nullptr;

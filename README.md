@@ -121,6 +121,8 @@ Stored in `<mod_config_dir>/config.json` (or `<mod_data_dir>/config.json`):
 | `pocDepth` | float (0..1) | `0.5` | Clip-space depth setting for test quad ($z_{NDC} = \text{depth} \times 2 - 1$). `0.0` = near plane, `1.0` = far plane. |
 | `pocColor` | string | `"ff00ff"` | Hex color string for test quad (`"rrggbb"` or `"rrggbbaa"`). Default is magenta (`#ff00ff`). |
 | `pocTrigger` | string | `"before_fbo1"` | Trigger point: `"before_fbo1"` (draw into FBO 0 immediately before switching to FBO 1) or `"after_depth_clear"` (draw immediately after `glClear(DEPTH)` on FBO 0). |
+| `poc3d` | boolean | `true` | Stage 3: When true, renders a 3D textured/shaded cube anchored in the Minecraft 3D world using the captured camera matrices. |
+| `poc3dDist` | float | `8.0` | Distance in blocks to anchor the 3D test cube in front of player camera when spawned. |
 | `probeCameraDiff` | boolean | `true` | Enables Probe B 3-snapshot memory diffing on `cullPointOrChunk`. |
 | `userNote` | string | `""` | Free-form notes with your recorded player coordinates at T1/T2/T3. |
 | `requireKnownBuild` | boolean | `true` | When true (default), signature-based probes are skipped if the loaded `libminecraftpe.so` GNU build-id does not match `712509dc14ccc233e91f267937dfb46ecdcc4b68`. |
