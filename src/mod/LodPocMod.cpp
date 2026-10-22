@@ -314,7 +314,7 @@ bool LodPocMod::load() {
             logAll(LogLevel::Warn, "Failed to read config.json, using defaults");
         } else {
             const auto &cfg = mConfigFile->value();
-            GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel);
+            GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel, cfg.traceDelayAfterWorldSec);
             CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
         }
         logAll(LogLevel::Info, "Loaded successfully");
@@ -625,7 +625,7 @@ void LodPocMod::checkConfigReload() {
         if (mConfigFile) {
             if (mConfigFile->load()) {
                 const auto &cfg = mConfigFile->value();
-                GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel);
+                GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel, cfg.traceDelayAfterWorldSec);
                 CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
             }
         }

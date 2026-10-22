@@ -80,7 +80,7 @@ public:
     void installHeavyHooks();
     void removeHeavyHooks();
 
-    void setConfig(bool traceFrame, bool traceRaw, const std::string &traceLabel);
+    void setConfig(bool traceFrame, bool traceRaw, const std::string &traceLabel, int traceDelayAfterWorldSec = 10);
     void armTrace(const std::string &label);
     void onSwapBuffers(uint64_t frameCount, double currentFps);
 
@@ -109,7 +109,7 @@ public:
     // Draw Tracking
     void onDraw(const RawDrawRecord &record);
 
-    std::atomic<uint64_t> mFrameDrawElements{0};
+    std::atomic<uint64_t> mPermanentFrameDraws{0};
 
     // Original GL function pointers
     using GlBindFramebufferFn = void (*)(GLenum target, GLuint framebuffer);
@@ -193,9 +193,12 @@ private:
     std::string mLastTracedLabel;
 
     bool mMainMenuTraced{false};
+    bool mWorldDetected{false};
     bool mInWorldTraced{false};
     bool mHeavyHooksInstalled{false};
-    std::chrono::steady_clock::time_point mFirstHeavyFrameTime{};
+    uint32_t mConsecutiveHeavyFrames{0};
+    std::chrono::steady_clock::time_point mWorldDetectedTime{};
+    int mConfigTraceDelayAfterWorldSec{10};
 
     double mLastRecordedFps{0.0};
 

@@ -34,7 +34,7 @@ This repository implements **log-only, non-intrusive diagnostic probes** designe
 
 ### How to Arm the Traces
 1. **Automatic Main Menu Trace**: Runs once shortly after startup (~frame 60) when menu rendering is active (`main_menu`).
-2. **Automatic In-World Trace**: Runs once ~10 seconds after the first frame with `glDrawElements > 500` (`in_world`).
+2. **Automatic In-World Trace**: The mod keeps a single permanent, cheap atomic counter hooking `glDrawElements`, `glDrawElementsInstanced`, and `glDrawArraysInstanced` with zero logging and zero allocations per frame. When draws-per-frame > 500 for 60 consecutive frames, it logs `"world detected"` and arms the `in_world` trace after `traceDelayAfterWorldSec` (default 10s), reinstalling the heavy hooks for exactly one frame to log the PASS SUMMARY before immediately removing them again.
 3. **Manual Re-Arming via `config.json`**:
    Edit `<mod_data_dir>/config.json` or `<mod_config_dir>/config.json`:
    ```json
@@ -80,6 +80,7 @@ Stored in `<mod_config_dir>/config.json` (or `<mod_data_dir>/config.json`):
 | `traceFrame` | boolean | `true` | Enables single-frame GL trace. Traces `main_menu` and `in_world` automatically once. |
 | `traceRaw` | boolean | `false` | When `false`, writes only the compact pass segment summary (~20 lines). When `true`, also dumps raw arguments for every draw call. |
 | `traceLabel` | string | `""` | User label for manual re-arming (e.g. set to `"inventory"` or `"paused"` to capture a specific state). |
+| `traceDelayAfterWorldSec` | integer | `10` | Delay in seconds after world detection (60 consecutive frames >500 draws) before capturing the in-world GL trace. |
 | `probeCameraDiff` | boolean | `true` | Enables Probe B 3-snapshot memory diffing on `cullPointOrChunk`. |
 | `userNote` | string | `""` | Free-form notes with your recorded player coordinates at T1/T2/T3. |
 | `requireKnownBuild` | boolean | `true` | When true (default), signature-based probes are skipped if the loaded `libminecraftpe.so` GNU build-id does not match `712509dc14ccc233e91f267937dfb46ecdcc4b68`. |

@@ -34,6 +34,7 @@ struct ModConfig {
     bool traceFrame = true;
     bool traceRaw = false;
     std::string traceLabel = "";
+    int traceDelayAfterWorldSec = 10;
 
     /** Probe B: Camera Position Discovery */
     bool probeCameraDiff = true;

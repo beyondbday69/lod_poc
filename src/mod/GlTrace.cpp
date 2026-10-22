@@ -59,11 +59,12 @@ GlTrace &GlTrace::instance() {
 
 GlTrace::GlTrace() = default;
 
-void GlTrace::setConfig(bool traceFrame, bool traceRaw, const std::string &traceLabel) {
+void GlTrace::setConfig(bool traceFrame, bool traceRaw, const std::string &traceLabel, int traceDelayAfterWorldSec) {
     std::lock_guard lock(mStateMutex);
     mConfigTraceFrame = traceFrame;
     mConfigTraceRaw = traceRaw;
     mConfigTraceLabel = traceLabel;
+    mConfigTraceDelayAfterWorldSec = traceDelayAfterWorldSec >= 0 ? traceDelayAfterWorldSec : 10;
     if (traceFrame && !traceLabel.empty() && traceLabel != mLastTracedLabel) {
         armTrace(traceLabel);
     }
@@ -83,7 +84,7 @@ void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
     const pid_t tid = gettid();
     setRenderThreadId(tid);
 
-    const uint64_t frameDraws = mFrameDrawElements.exchange(0, std::memory_order_relaxed);
+    const uint64_t frameDraws = mPermanentFrameDraws.exchange(0, std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
 
     TraceState currentState = mState.load(std::memory_order_acquire);
@@ -123,6 +124,21 @@ void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
         return;
     }
 
+    // Check consecutive heavy frames for world detection (>500 draws)
+    if (frameDraws > 500) {
+        mConsecutiveHeavyFrames++;
+    } else {
+        mConsecutiveHeavyFrames = 0;
+    }
+
+    if (!mWorldDetected && mConsecutiveHeavyFrames >= 60) {
+        mWorldDetected = true;
+        mWorldDetectedTime = now;
+        LodPocMod::logAll(LogLevel::Info,
+                          "[GLTrace] world detected (60 consecutive frames with >500 draws, frame #{} had {} draws). Arming in-world trace in ~{}s.",
+                          frameCount, frameDraws, mConfigTraceDelayAfterWorldSec);
+    }
+
     // Check automatic triggers when idle
     if (currentState == TraceState::Idle && mConfigTraceFrame) {
         // Trigger 1: Main menu trace (frame > 50 and at least 30 draws)
@@ -132,16 +148,9 @@ void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
             return;
         }
 
-        // Trigger 2: In-world trace (~10s after first frame with glDrawElements > 500)
-        if (frameDraws > 500 && mFirstHeavyFrameTime == std::chrono::steady_clock::time_point{}) {
-            mFirstHeavyFrameTime = now;
-            LodPocMod::logAll(LogLevel::Info,
-                              "[GLTrace] In-world heavy draw detected (#{} draws in frame {}). Arming in-world trace in ~10s.",
-                              frameDraws, frameCount);
-        }
-
-        if (!mInWorldTraced && mFirstHeavyFrameTime != std::chrono::steady_clock::time_point{}) {
-            if (now >= mFirstHeavyFrameTime + std::chrono::seconds(10)) {
+        // Trigger 2: In-world trace (~10s after world detected)
+        if (mWorldDetected && !mInWorldTraced) {
+            if (now >= mWorldDetectedTime + std::chrono::seconds(mConfigTraceDelayAfterWorldSec)) {
                 mInWorldTraced = true;
                 std::string label = mConfigTraceLabel.empty() ? "in_world" : mConfigTraceLabel;
                 armTrace(label);
@@ -561,47 +570,53 @@ void GlTrace::detourDrawArrays(GLenum mode, GLint first, GLsizei count) {
 void GlTrace::detourDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
     auto &inst = GlTrace::instance();
     if (inst.mOrigDrawArraysInstanced != nullptr) inst.mOrigDrawArraysInstanced(mode, first, count, instancecount);
-    RawDrawRecord rec;
-    rec.functionName = "glDrawArraysInstanced";
-    rec.mode = mode;
-    rec.first = first;
-    rec.count = count;
-    rec.instanceCount = instancecount;
-    inst.onDraw(rec);
+    inst.mPermanentFrameDraws.fetch_add(1, std::memory_order_relaxed);
+    if (inst.mState.load(std::memory_order_relaxed) == TraceState::Recording) {
+        RawDrawRecord rec;
+        rec.functionName = "glDrawArraysInstanced";
+        rec.mode = mode;
+        rec.first = first;
+        rec.count = count;
+        rec.instanceCount = instancecount;
+        inst.onDraw(rec);
+    }
 }
 
 void GlTrace::detourDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
     auto &inst = GlTrace::instance();
     if (inst.mOrigDrawElements != nullptr) inst.mOrigDrawElements(mode, count, type, indices);
-    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
-    RawDrawRecord rec;
-    rec.functionName = "glDrawElements";
-    rec.mode = mode;
-    rec.count = count;
-    rec.type = type;
-    rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indices);
-    rec.instanceCount = 1;
-    inst.onDraw(rec);
+    inst.mPermanentFrameDraws.fetch_add(1, std::memory_order_relaxed);
+    if (inst.mState.load(std::memory_order_relaxed) == TraceState::Recording) {
+        RawDrawRecord rec;
+        rec.functionName = "glDrawElements";
+        rec.mode = mode;
+        rec.count = count;
+        rec.type = type;
+        rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indices);
+        rec.instanceCount = 1;
+        inst.onDraw(rec);
+    }
 }
 
 void GlTrace::detourDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) {
     auto &inst = GlTrace::instance();
     if (inst.mOrigDrawElementsInstanced != nullptr) inst.mOrigDrawElementsInstanced(mode, count, type, indices, instancecount);
-    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
-    RawDrawRecord rec;
-    rec.functionName = "glDrawElementsInstanced";
-    rec.mode = mode;
-    rec.count = count;
-    rec.type = type;
-    rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indices);
-    rec.instanceCount = instancecount;
-    inst.onDraw(rec);
+    inst.mPermanentFrameDraws.fetch_add(1, std::memory_order_relaxed);
+    if (inst.mState.load(std::memory_order_relaxed) == TraceState::Recording) {
+        RawDrawRecord rec;
+        rec.functionName = "glDrawElementsInstanced";
+        rec.mode = mode;
+        rec.count = count;
+        rec.type = type;
+        rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indices);
+        rec.instanceCount = instancecount;
+        inst.onDraw(rec);
+    }
 }
 
 void GlTrace::detourDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) {
     auto &inst = GlTrace::instance();
     if (inst.mOrigDrawRangeElements != nullptr) inst.mOrigDrawRangeElements(mode, start, end, count, type, indices);
-    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
     RawDrawRecord rec;
     rec.functionName = "glDrawRangeElements";
     rec.mode = mode;
@@ -617,7 +632,6 @@ void GlTrace::detourDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLs
 void GlTrace::detourDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLint basevertex) {
     auto &inst = GlTrace::instance();
     if (inst.mOrigDrawElementsBaseVertex != nullptr) inst.mOrigDrawElementsBaseVertex(mode, count, type, indices, basevertex);
-    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
     RawDrawRecord rec;
     rec.functionName = "glDrawElementsBaseVertex";
     rec.mode = mode;
@@ -632,7 +646,6 @@ void GlTrace::detourDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum ty
 void GlTrace::detourDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount, GLint basevertex) {
     auto &inst = GlTrace::instance();
     if (inst.mOrigDrawElementsInstancedBaseVertex != nullptr) inst.mOrigDrawElementsInstancedBaseVertex(mode, count, type, indices, instancecount, basevertex);
-    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
     RawDrawRecord rec;
     rec.functionName = "glDrawElementsInstancedBaseVertex";
     rec.mode = mode;
@@ -647,7 +660,6 @@ void GlTrace::detourDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, 
 void GlTrace::detourDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices, GLint basevertex) {
     auto &inst = GlTrace::instance();
     if (inst.mOrigDrawRangeElementsBaseVertex != nullptr) inst.mOrigDrawRangeElementsBaseVertex(mode, start, end, count, type, indices, basevertex);
-    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
     RawDrawRecord rec;
     rec.functionName = "glDrawRangeElementsBaseVertex";
     rec.mode = mode;
@@ -674,7 +686,6 @@ void GlTrace::detourDrawArraysIndirect(GLenum mode, const void *indirect) {
 void GlTrace::detourDrawElementsIndirect(GLenum mode, GLenum type, const void *indirect) {
     auto &inst = GlTrace::instance();
     if (inst.mOrigDrawElementsIndirect != nullptr) inst.mOrigDrawElementsIndirect(mode, type, indirect);
-    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
     RawDrawRecord rec;
     rec.functionName = "glDrawElementsIndirect";
     rec.mode = mode;
@@ -702,7 +713,6 @@ void GlTrace::detourMultiDrawArraysEXT(GLenum mode, const GLint *first, const GL
 void GlTrace::detourMultiDrawElementsEXT(GLenum mode, const GLsizei *count, GLenum type, const void *const *indices, GLsizei primcount) {
     auto &inst = GlTrace::instance();
     if (inst.mOrigMultiDrawElementsEXT != nullptr) inst.mOrigMultiDrawElementsEXT(mode, count, type, indices, primcount);
-    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
     RawDrawRecord rec;
     rec.functionName = "glMultiDrawElementsEXT";
     rec.mode = mode;
@@ -727,26 +737,61 @@ void GlTrace::install() {
     void *glesLib = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
     if (!glesLib) glesLib = dlopen("libGLESv3.so", RTLD_NOW | RTLD_GLOBAL);
 
-    void *target = glesLib ? dlsym(glesLib, "glBindFramebuffer") : nullptr;
-    if (!target) target = dlsym(RTLD_DEFAULT, "glBindFramebuffer");
+    auto hookPermanent = [this, glesLib](const char *primaryName, const std::vector<const char *> &alts, void *detour, void **orig) {
+        void *target = nullptr;
+        std::string foundName;
 
-    if (target != nullptr) {
-        pl::memory::HookHandle handle(target,
-                                      reinterpret_cast<void *>(&detourBindFramebuffer),
-                                      reinterpret_cast<void **>(&mOrigBindFramebuffer));
-        if (handle.installed()) {
-            mPermanentHooks.push_back(std::move(handle));
-            LodPocMod::logAll(LogLevel::Info, "[GLTrace] Permanent glBindFramebuffer hooked at {:p}", target);
+        std::vector<const char *> candidates;
+        candidates.push_back(primaryName);
+        for (const auto *a : alts) candidates.push_back(a);
+
+        for (const auto *cand : candidates) {
+            if (glesLib) target = dlsym(glesLib, cand);
+            if (!target) target = dlsym(RTLD_DEFAULT, cand);
+            if (target) {
+                foundName = cand;
+                break;
+            }
         }
-    }
 
-    installHeavyHooks();
+        if (target == nullptr) {
+            LodPocMod::logAll(LogLevel::Info, "[GLTrace] Permanent hook target '{}' not present in GLES driver.", primaryName);
+            return;
+        }
+
+        pl::memory::HookHandle handle(target, detour, orig);
+        if (!handle.installed()) {
+            LodPocMod::logAll(LogLevel::Warn, "[GLTrace] Failed to hook permanent '{}' at {:p}", foundName, target);
+        } else {
+            mPermanentHooks.push_back(std::move(handle));
+            LodPocMod::logAll(LogLevel::Info, "[GLTrace] Permanent hook '{}' installed at {:p}", foundName, target);
+        }
+    };
+
+    hookPermanent("glBindFramebuffer", {},
+                  reinterpret_cast<void *>(&detourBindFramebuffer),
+                  reinterpret_cast<void **>(&mOrigBindFramebuffer));
+
+    hookPermanent("glDrawElements", {},
+                  reinterpret_cast<void *>(&detourDrawElements),
+                  reinterpret_cast<void **>(&mOrigDrawElements));
+
+    hookPermanent("glDrawElementsInstanced", {"glDrawElementsInstancedEXT", "glDrawElementsInstancedOES"},
+                  reinterpret_cast<void *>(&detourDrawElementsInstanced),
+                  reinterpret_cast<void **>(&mOrigDrawElementsInstanced));
+
+    hookPermanent("glDrawArraysInstanced", {"glDrawArraysInstancedEXT", "glDrawArraysInstancedOES"},
+                  reinterpret_cast<void *>(&detourDrawArraysInstanced),
+                  reinterpret_cast<void **>(&mOrigDrawArraysInstanced));
 }
 
 void GlTrace::remove() {
     removeHeavyHooks();
     mPermanentHooks.clear();
     mOrigBindFramebuffer = nullptr;
+    mOrigDrawElements = nullptr;
+    mOrigDrawElementsInstanced = nullptr;
+    mOrigDrawArraysInstanced = nullptr;
 }
 
 void GlTrace::installHeavyHooks() {
@@ -786,11 +831,8 @@ void GlTrace::installHeavyHooks() {
         }
     };
 
-    // Draw Hooks
+    // Draw Hooks (glDrawElements, glDrawElementsInstanced, glDrawArraysInstanced are handled by permanent hooks)
     hookFn("glDrawArrays", {}, reinterpret_cast<void *>(&detourDrawArrays), reinterpret_cast<void **>(&mOrigDrawArrays));
-    hookFn("glDrawArraysInstanced", {"glDrawArraysInstancedEXT", "glDrawArraysInstancedOES"}, reinterpret_cast<void *>(&detourDrawArraysInstanced), reinterpret_cast<void **>(&mOrigDrawArraysInstanced));
-    hookFn("glDrawElements", {}, reinterpret_cast<void *>(&detourDrawElements), reinterpret_cast<void **>(&mOrigDrawElements));
-    hookFn("glDrawElementsInstanced", {"glDrawElementsInstancedEXT", "glDrawElementsInstancedOES"}, reinterpret_cast<void *>(&detourDrawElementsInstanced), reinterpret_cast<void **>(&mOrigDrawElementsInstanced));
     hookFn("glDrawRangeElements", {"glDrawRangeElementsEXT", "glDrawRangeElementsOES"}, reinterpret_cast<void *>(&detourDrawRangeElements), reinterpret_cast<void **>(&mOrigDrawRangeElements));
     hookFn("glDrawElementsBaseVertex", {"glDrawElementsBaseVertexOES", "glDrawElementsBaseVertexEXT"}, reinterpret_cast<void *>(&detourDrawElementsBaseVertex), reinterpret_cast<void **>(&mOrigDrawElementsBaseVertex));
     hookFn("glDrawElementsInstancedBaseVertex", {"glDrawElementsInstancedBaseVertexOES", "glDrawElementsInstancedBaseVertexEXT"}, reinterpret_cast<void *>(&detourDrawElementsInstancedBaseVertex), reinterpret_cast<void **>(&mOrigDrawElementsInstancedBaseVertex));
@@ -843,9 +885,6 @@ void GlTrace::removeHeavyHooks() {
     mOrigUseProgram = nullptr;
 
     mOrigDrawArrays = nullptr;
-    mOrigDrawArraysInstanced = nullptr;
-    mOrigDrawElements = nullptr;
-    mOrigDrawElementsInstanced = nullptr;
     mOrigDrawRangeElements = nullptr;
     mOrigDrawElementsBaseVertex = nullptr;
     mOrigDrawElementsInstancedBaseVertex = nullptr;
