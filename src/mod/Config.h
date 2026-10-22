@@ -31,7 +31,7 @@ struct ModConfig {
     bool buildLodMap = true;
 
     /** Optional periodic world rescan interval in seconds (0 = scan once). */
-    int rescanIntervalSec = 0;
+    int rescanIntervalSec = 10;
 
     /** Probe A: GL Frame Trace */
     bool traceFrame = true;
@@ -61,6 +61,10 @@ struct ModConfig {
     /** Stage 3: 3D World Cube Test */
     bool poc3d = true;
     float poc3dDist = 8.0f;
+
+    /** Stage 4: LOD Terrain Distance Cutoffs (blocks) */
+    float minLodDist = 64.0f;
+    float maxLodDist = 512.0f;
 };
 
 nlohmann::json makeDefaultConfigJson();

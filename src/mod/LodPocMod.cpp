@@ -317,7 +317,7 @@ bool LodPocMod::load() {
             const auto &cfg = mConfigFile->value();
             GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel, cfg.traceDelayAfterWorldSec);
             CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
-            PocQuad::instance().setConfig(cfg.pocQuad, cfg.pocDepth, cfg.pocColor, cfg.pocTrigger, cfg.poc3d, cfg.poc3dDist);
+            PocQuad::instance().setConfig(cfg.pocQuad, cfg.pocDepth, cfg.pocColor, cfg.pocTrigger, cfg.poc3d, cfg.poc3dDist, cfg.minLodDist, cfg.maxLodDist);
             PocQuad::instance().setOriginConfig(cfg.originX, cfg.originY, cfg.originZ, cfg.originValid);
         }
         logAll(LogLevel::Info, "Loaded successfully");
@@ -634,7 +634,7 @@ void LodPocMod::checkConfigReload() {
                 const auto &cfg = mConfigFile->value();
                 GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel, cfg.traceDelayAfterWorldSec);
                 CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
-                PocQuad::instance().setConfig(cfg.pocQuad, cfg.pocDepth, cfg.pocColor, cfg.pocTrigger, cfg.poc3d, cfg.poc3dDist);
+                PocQuad::instance().setConfig(cfg.pocQuad, cfg.pocDepth, cfg.pocColor, cfg.pocTrigger, cfg.poc3d, cfg.poc3dDist, cfg.minLodDist, cfg.maxLodDist);
                 PocQuad::instance().setOriginConfig(cfg.originX, cfg.originY, cfg.originZ, cfg.originValid);
 
                 if (cfg.buildLodMap) {

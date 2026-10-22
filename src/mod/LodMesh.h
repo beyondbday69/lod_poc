@@ -48,13 +48,17 @@ class LodMeshBuilder {
                                      const std::unordered_map<uint64_t, ChunkColumnData> &chunks);
 
     /**
-     * @brief Builds low-poly heightfield tile meshes for all 16x16-chunk areas that contain chunks.
+     * @brief Builds low-poly heightfield tile meshes around the player.
      *
      * @param tier LOD tier (1: 2x2, 2: 4x4, 3: 8x8, 4: 16x16)
+     * @param playerWorldX Player world X coordinate
+     * @param playerWorldZ Player world Z coordinate
      * @param chunks Extracted Overworld chunk database
      */
     static std::vector<LodTileMesh> buildAllTiles(
         int tier,
+        float playerWorldX,
+        float playerWorldZ,
         const std::unordered_map<uint64_t, ChunkColumnData> &chunks);
 };
 

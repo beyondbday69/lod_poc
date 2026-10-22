@@ -35,7 +35,7 @@ public:
         return mInWorld.load(std::memory_order_relaxed);
     }
 
-    void setConfig(bool enabled, float depth, const std::string &colorHex, const std::string &trigger, bool poc3d = true, float poc3dDist = 8.0f);
+    void setConfig(bool enabled, float depth, const std::string &colorHex, const std::string &trigger, bool poc3d = true, float poc3dDist = 8.0f, float minLodDist = 64.0f, float maxLodDist = 512.0f);
 
     /** Update the F3 origin.  Applied on the render thread at the next frame boundary. */
     void setOriginConfig(float x, float y, float z, bool valid);
@@ -111,6 +111,8 @@ private:
     std::atomic<float> mDepth{0.5f};
     std::atomic<bool> mPoc3d{true};
     std::atomic<float> mPoc3dDist{8.0f};
+    std::atomic<float> mMinLodDist{64.0f};
+    std::atomic<float> mMaxLodDist{512.0f};
 
     std::mutex mConfigMutex;
     std::string mColorHex{"ff00ff"};
@@ -195,6 +197,8 @@ private:
     GLint mLodLocProj{-1};
     GLint mLodLocView{-1};
     GLint mLodLocCameraPos{-1};
+    GLint mLodLocMinDist{-1};
+    GLint mLodLocMaxDist{-1};
 
     float mDiscoveredPlayerPos[3]{0.0f, 0.0f, 0.0f};
     bool mHasDiscoveredPlayerPos{false};

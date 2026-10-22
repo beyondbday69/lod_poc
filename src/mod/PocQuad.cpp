@@ -206,7 +206,7 @@ bool PocQuad::isRendering() {
     return sInsideQuadRender;
 }
 
-void PocQuad::setConfig(bool enabled, float depth, const std::string &colorHex, const std::string &trigger, bool poc3d, float poc3dDist) {
+void PocQuad::setConfig(bool enabled, float depth, const std::string &colorHex, const std::string &trigger, bool poc3d, float poc3dDist, float minLodDist, float maxLodDist) {
     bool wasEnabled = mEnabled.load(std::memory_order_relaxed);
     mEnabled.store(enabled, std::memory_order_relaxed);
     mDepth.store(std::clamp(depth, 0.0f, 1.0f), std::memory_order_relaxed);
@@ -216,6 +216,8 @@ void PocQuad::setConfig(bool enabled, float depth, const std::string &colorHex, 
     bool old3d = mPoc3d.load(std::memory_order_relaxed);
     mPoc3d.store(poc3d, std::memory_order_relaxed);
     mPoc3dDist.store(newDist, std::memory_order_relaxed);
+    mMinLodDist.store(std::max(16.0f, minLodDist), std::memory_order_relaxed);
+    mMaxLodDist.store(std::max(minLodDist + 32.0f, maxLodDist), std::memory_order_relaxed);
 
     if (oldDist != newDist || old3d != poc3d) {
         mCubeAnchored = false;
@@ -234,8 +236,8 @@ void PocQuad::setConfig(bool enabled, float depth, const std::string &colorHex, 
         mCubeAnchored = false;
         mAbsoluteAnchor = false;
         LodPocMod::logAll(LogLevel::Info,
-            "[PocQuad] Enabled: 3D_Cube={}, dist={:.1f}, depth={:.3f}, color='#{}', trigger='{}'",
-            poc3d ? "true" : "false", poc3dDist, depth, colorHex, trigger);
+            "[PocQuad] Enabled: 3D_Cube={}, dist={:.1f}, minLodDist={:.1f}, maxLodDist={:.1f}, depth={:.3f}, color='#{}', trigger='{}'",
+            poc3d ? "true" : "false", poc3dDist, minLodDist, maxLodDist, depth, colorHex, trigger);
     }
 }
 
@@ -949,12 +951,14 @@ bool PocQuad::initLodGL() {
         "uniform mat4 uView;\n"
         "uniform vec3 uCameraPos;\n"
         "out vec3 vWorldPos;\n"
+        "out vec3 vRelPos;\n"
         "out vec4 vColor;\n"
         "void main() {\n"
         "    vec3 relPos = aPos - uCameraPos;\n"
         "    vec4 eyePos = uView * vec4(relPos, 1.0);\n"
         "    gl_Position = uProj * eyePos;\n"
         "    vWorldPos = aPos;\n"
+        "    vRelPos = relPos;\n"
         "    vColor = aColor;\n"
         "}\n";
 
@@ -962,16 +966,26 @@ bool PocQuad::initLodGL() {
         "#version 300 es\n"
         "precision mediump float;\n"
         "in vec3 vWorldPos;\n"
+        "in vec3 vRelPos;\n"
         "in vec4 vColor;\n"
+        "uniform float uMinLodDist;\n"
+        "uniform float uMaxLodDist;\n"
         "out vec4 fragColor;\n"
         "void main() {\n"
+        "    float distXZ = length(vRelPos.xz);\n"
+        "    if (distXZ < uMinLodDist || distXZ > uMaxLodDist) {\n"
+        "        discard;\n"
+        "    }\n"
         "    vec3 dX = dFdx(vWorldPos);\n"
         "    vec3 dY = dFdy(vWorldPos);\n"
         "    vec3 normal = normalize(cross(dX, dY));\n"
         "    if (normal.y < 0.0) normal = -normal;\n"
         "    vec3 lightDir = normalize(vec3(0.4, 0.9, 0.3));\n"
         "    float diff = max(dot(normal, lightDir), 0.55);\n"
-        "    fragColor = vec4(vColor.rgb * diff, 1.0);\n"
+        "    float fogFactor = clamp((distXZ - (uMaxLodDist - 128.0)) / 128.0, 0.0, 1.0);\n"
+        "    vec3 fogColor = vec3(0.70, 0.80, 0.92);\n"
+        "    vec3 finalRgb = mix(vColor.rgb * diff, fogColor, fogFactor);\n"
+        "    fragColor = vec4(finalRgb, 1.0);\n"
         "}\n";
 
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
@@ -1020,6 +1034,8 @@ bool PocQuad::initLodGL() {
     mLodLocProj = glGetUniformLocation(mLodProgram, "uProj");
     mLodLocView = glGetUniformLocation(mLodProgram, "uView");
     mLodLocCameraPos = glGetUniformLocation(mLodProgram, "uCameraPos");
+    mLodLocMinDist = glGetUniformLocation(mLodProgram, "uMinLodDist");
+    mLodLocMaxDist = glGetUniformLocation(mLodProgram, "uMaxLodDist");
 
     mLodGlInitialized = true;
     LodPocMod::logAll(LogLevel::Info,
@@ -1109,6 +1125,8 @@ void PocQuad::drawLodTerrain(GLuint targetFbo, GLenum terrainDepthFunc) {
     glUniformMatrix4fv(mLodLocProj, 1, GL_FALSE, mProjMatrix);
     glUniformMatrix4fv(mLodLocView, 1, GL_FALSE, mViewMatrix);
     glUniform3f(mLodLocCameraPos, mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2]);
+    glUniform1f(mLodLocMinDist, mMinLodDist.load(std::memory_order_relaxed));
+    glUniform1f(mLodLocMaxDist, mMaxLodDist.load(std::memory_order_relaxed));
 
     for (const auto &buf : mLodGlBuffers) {
         glBindVertexArray(buf.vao);

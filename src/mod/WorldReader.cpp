@@ -758,7 +758,7 @@ void WorldReader::runScan(const std::filesystem::path &primaryDir,
     }
 
     // 2. Build all LOD terrain tiles and send to GPU
-    auto allMeshes = LodMeshBuilder::buildAllTiles(2, state.chunks);
+    auto allMeshes = LodMeshBuilder::buildAllTiles(2, resolvedPlayerPos[0], resolvedPlayerPos[2], state.chunks);
     size_t totalTiles = allMeshes.size();
     size_t totalVerts = 0;
     size_t totalIndices = 0;

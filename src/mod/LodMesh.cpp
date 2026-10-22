@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 
 namespace lod_poc {
 namespace {
@@ -61,6 +62,22 @@ LodTileMesh LodMeshBuilder::buildTileMesh(
             if (it != chunks.end()) {
                 gridHeights[gz * vertGridSize + gx] = static_cast<float>(it->second.heights[colIdx]);
                 gridColors[gz * vertGridSize + gx] = it->second.colors[colIdx];
+            } else {
+                // Procedural terrain fill for unvisited/distant chunks beyond LevelDB
+                const float wx = static_cast<float>(targetChunkX * 16 + localBlockX);
+                const float wz = static_cast<float>(targetChunkZ * 16 + localBlockZ);
+                const float h = 66.0f + 8.0f * std::sin(wx * 0.015f) * std::cos(wz * 0.015f)
+                                      + 4.0f * std::sin((wx + wz) * 0.035f);
+                gridHeights[gz * vertGridSize + gx] = h;
+                if (h < 63.0f) {
+                    gridColors[gz * vertGridSize + gx] = RGB{46, 88, 160}; // Water blue
+                } else if (h < 65.0f) {
+                    gridColors[gz * vertGridSize + gx] = RGB{215, 205, 155}; // Sand
+                } else if (h > 76.0f) {
+                    gridColors[gz * vertGridSize + gx] = RGB{120, 120, 120}; // Mountain stone
+                } else {
+                    gridColors[gz * vertGridSize + gx] = RGB{88, 148, 55}; // Grass green
+                }
             }
         }
     }
@@ -165,46 +182,24 @@ LodTileMesh LodMeshBuilder::buildTileMesh(
 
 std::vector<LodTileMesh> LodMeshBuilder::buildAllTiles(
     int tier,
+    float playerWorldX,
+    float playerWorldZ,
     const std::unordered_map<uint64_t, ChunkColumnData> &chunks) {
 
     std::vector<LodTileMesh> result;
-    if (chunks.empty()) return result;
-
-    int32_t minX = INT32_MAX, maxX = INT32_MIN;
-    int32_t minZ = INT32_MAX, maxZ = INT32_MIN;
-
-    for (const auto &pair : chunks) {
-        minX = std::min(minX, pair.second.chunkX);
-        maxX = std::max(maxX, pair.second.chunkX);
-        minZ = std::min(minZ, pair.second.chunkZ);
-        maxZ = std::max(maxZ, pair.second.chunkZ);
-    }
 
     auto floorDiv16 = [](int32_t v) -> int32_t {
         return (v >= 0) ? (v / 16) : ((v - 15) / 16);
     };
 
-    const int32_t tileMinX = floorDiv16(minX);
-    const int32_t tileMaxX = floorDiv16(maxX);
-    const int32_t tileMinZ = floorDiv16(minZ);
-    const int32_t tileMaxZ = floorDiv16(maxZ);
+    const int32_t playerChunkX = static_cast<int32_t>(std::floor(playerWorldX / 16.0f));
+    const int32_t playerChunkZ = static_cast<int32_t>(std::floor(playerWorldZ / 16.0f));
+    const int32_t centerTileX = floorDiv16(playerChunkX);
+    const int32_t centerTileZ = floorDiv16(playerChunkZ);
 
-    for (int32_t tz = tileMinZ; tz <= tileMaxZ; ++tz) {
-        for (int32_t tx = tileMinX; tx <= tileMaxX; ++tx) {
-            // Check if any chunk in chunks falls into this 16x16-chunk tile
-            bool hasChunks = false;
-            for (int cz = 0; cz < 16; ++cz) {
-                for (int cx = 0; cx < 16; ++cx) {
-                    uint64_t key = makeChunkCoordKey(tx * 16 + cx, tz * 16 + cz);
-                    if (chunks.find(key) != chunks.end()) {
-                        hasChunks = true;
-                        break;
-                    }
-                }
-                if (hasChunks) break;
-            }
-            if (!hasChunks) continue;
-
+    // Build a 3x3 grid of 16x16-chunk tiles (48x48 chunks = 768x768 blocks) centered on player
+    for (int32_t tz = centerTileZ - 1; tz <= centerTileZ + 1; ++tz) {
+        for (int32_t tx = centerTileX - 1; tx <= centerTileX + 1; ++tx) {
             auto tileMesh = buildTileMesh(tx * 16, tz * 16, tier, chunks);
             if (!tileMesh.indices.empty()) {
                 result.push_back(std::move(tileMesh));
