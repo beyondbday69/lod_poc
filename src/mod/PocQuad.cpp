@@ -128,12 +128,14 @@ static const CubeVertex sCubeVertices[] = {
 };
 
 static const GLushort sCubeIndices[] = {
-    0, 1, 2,  0, 2, 3,        // Top
-    4, 6, 5,  4, 7, 6,        // Bottom
-    8, 9, 10,  8, 10, 11,     // Front
-    12, 13, 14,  12, 14, 15,  // Back
-    16, 17, 18,  16, 18, 19,  // Right
-    20, 21, 22,  20, 22, 23   // Left
+    // All faces must be CCW when viewed from outside so their geometric
+    // normal matches the per-vertex normal above.
+    0, 2, 1,  0, 3, 2,        // Top (+Y)
+    4, 5, 6,  4, 6, 7,        // Bottom (-Y)
+    8, 9, 10,  8, 10, 11,     // Front (+Z)
+    12, 13, 14,  12, 14, 15,  // Back (-Z)
+    16, 17, 18,  16, 18, 19,  // Right (+X)
+    20, 21, 22,  20, 22, 23   // Left (-X)
 };
 
 } // namespace
@@ -554,12 +556,17 @@ void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(mLastDepthFuncUsed);
-    glDepthMask(GL_FALSE);
+    // The cube is a solid world object: let it write depth so its own front
+    // and back faces resolve against each other in the depth buffer.
+    glDepthMask(GL_TRUE);
     glDepthRangef(0.0f, 1.0f);
 
     glDisable(GL_BLEND);
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
+    // Bedrock's projection matrix contains a Y flip, which reverses the
+    // screen-space winding of the cube. Render it double-sided so no face
+    // can be lost to back-face culling; depth testing still hides the far
+    // faces of this closed mesh.
+    glDisable(GL_CULL_FACE);
     glDisable(GL_STENCIL_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
