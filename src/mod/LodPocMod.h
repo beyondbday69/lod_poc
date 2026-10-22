@@ -9,8 +9,10 @@
 #include <optional>
 #include <string_view>
 
+#include "mod/CameraProbe.h"
 #include "mod/Config.h"
 #include "mod/FileLog.h"
+#include "mod/GlTrace.h"
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -35,8 +37,8 @@ struct Vec3 {
 /**
  * @brief LOD Proof-of-Concept Diagnostic Mod for LeviLaunchroid.
  *
- * Runs 5 non-intrusive, log-only probes to verify hook points, graphics backend,
- * and chunk/camera pipeline states for distant terrain rendering.
+ * Runs non-intrusive, log-only probes to verify hook points, graphics backend,
+ * camera coordinates, and LevelDB world/mesh state.
  */
 class LodPocMod {
   public:
@@ -50,6 +52,9 @@ class LodPocMod {
     bool enable();
     bool disable();
     bool unload();
+
+    void onBindFramebuffer(GLenum target, GLuint framebuffer);
+    void checkConfigReload();
 
     template <typename... Args>
     static void logAll(LogLevel level, fmt::format_string<Args...> fmtStr, Args &&...args) {
@@ -78,7 +83,6 @@ class LodPocMod {
   private:
     using ChunkLightingTaskFn = void (*)(void *a0, void *a1, void *a2, void *a3,
                                          void *a4, void *a5, void *a6, void *a7);
-    using BindFramebufferFn = void (*)(GLenum target, GLuint framebuffer);
     using EglSwapBuffersFn = EGLBoolean (*)(EGLDisplay dpy, EGLSurface surf);
     using CullPointOrChunkFn = void *(*)(void *a0, void *a1, void *a2, void *a3,
                                          void *a4, void *a5, void *a6, void *a7);
@@ -87,6 +91,7 @@ class LodPocMod {
     ll::mod::NativeMod &mSelf;
     mutable std::mutex mConfigMutex;
     std::optional<pl::config::ConfigFile<ModConfig>> mConfigFile;
+    std::chrono::steady_clock::time_point mLastConfigCheck{};
 
     // Probe 1: ChunkSource::_lightingTask
     pl::memory::HookHandle mLightingHook;
@@ -96,9 +101,7 @@ class LodPocMod {
     std::chrono::steady_clock::time_point mLastLightingReport{};
     std::mutex mLightingMutex;
 
-    // Probe 2: glBindFramebuffer
-    pl::memory::HookHandle mBindFramebufferHook;
-    BindFramebufferFn mOriginalBindFramebuffer{nullptr};
+    // Probe 2: glBindFramebuffer tracking
     std::atomic<uint64_t> mBindCalls{0};
     static constexpr size_t kMaxFrameBinds = 64;
     std::array<GLuint, kMaxFrameBinds> mFrameBinds{};
@@ -126,7 +129,6 @@ class LodPocMod {
     // Detours
     static void lightingTaskDetour(void *a0, void *a1, void *a2, void *a3,
                                    void *a4, void *a5, void *a6, void *a7);
-    static void bindFramebufferDetour(GLenum target, GLuint framebuffer);
     static EGLBoolean swapBuffersDetour(EGLDisplay dpy, EGLSurface surf);
     static void *cullPointOrChunkDetour(void *a0, void *a1, void *a2, void *a3,
                                         void *a4, void *a5, void *a6, void *a7);

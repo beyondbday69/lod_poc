@@ -299,6 +299,10 @@ bool LodPocMod::load() {
                             self.getConfigDir() / "config.schema.json");
         if (!mConfigFile->load()) {
             logAll(LogLevel::Warn, "Failed to read config.json, using defaults");
+        } else {
+            const auto &cfg = mConfigFile->value();
+            GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceLabel);
+            CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
         }
         logAll(LogLevel::Info, "Loaded successfully");
         return true;
@@ -352,6 +356,8 @@ bool LodPocMod::disable() {
         logAll(LogLevel::Info, "Disabling LOD PoC diagnostic probes...");
         removeProbes();
         restoreCrashHandlers();
+        GlTrace::instance().remove();
+        CameraProbe::instance().reset();
         logAll(LogLevel::Info, "LOD PoC mod disabled");
         return true;
     } catch (const std::exception &ex) {
@@ -367,6 +373,8 @@ bool LodPocMod::unload() {
         logAll(LogLevel::Info, "Unloading LOD PoC mod...");
         removeProbes();
         restoreCrashHandlers();
+        GlTrace::instance().remove();
+        CameraProbe::instance().reset();
         {
             std::lock_guard lock(mConfigMutex);
             mConfigFile.reset();
@@ -413,32 +421,9 @@ void LodPocMod::installProbes() {
     }
 
     // -------------------------------------------------------------------------
-    // Probe 2: glBindFramebuffer
+    // Probe 2 & Probe A: OpenGL ES trace hooks
     // -------------------------------------------------------------------------
-    void *bindFbTarget = nullptr;
-    void *glesLib = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
-    if (glesLib != nullptr) {
-        bindFbTarget = dlsym(glesLib, "glBindFramebuffer");
-    }
-    if (bindFbTarget == nullptr) {
-        bindFbTarget = dlsym(RTLD_DEFAULT, "glBindFramebuffer");
-    }
-    if (bindFbTarget == nullptr) {
-        logAll(LogLevel::Warn, "[Probe 2: glBindFramebuffer] NOT FOUND");
-    } else {
-        void *orig = nullptr;
-        pl::memory::HookHandle handle(
-            bindFbTarget,
-            reinterpret_cast<void *>(&LodPocMod::bindFramebufferDetour),
-            &orig);
-        if (!handle.installed()) {
-            logAll(LogLevel::Error, "[Probe 2: glBindFramebuffer] FAILED at {:p}", bindFbTarget);
-        } else {
-            mOriginalBindFramebuffer = reinterpret_cast<BindFramebufferFn>(orig);
-            mBindFramebufferHook = std::move(handle);
-            logAll(LogLevel::Info, "[Probe 2: glBindFramebuffer] Hooked at {:p}", bindFbTarget);
-        }
-    }
+    GlTrace::instance().install();
 
     // -------------------------------------------------------------------------
     // Probe 3: eglSwapBuffers
@@ -507,14 +492,44 @@ void LodPocMod::removeProbes() {
     mLightingHook.reset();
     mOriginalLightingTask = nullptr;
 
-    mBindFramebufferHook.reset();
-    mOriginalBindFramebuffer = nullptr;
+    GlTrace::instance().remove();
 
     mSwapBuffersHook.reset();
     mOriginalSwapBuffers = nullptr;
 
     mCullHook.reset();
     mOriginalCull = nullptr;
+}
+
+void LodPocMod::onBindFramebuffer(GLenum target, GLuint framebuffer) {
+    const uint64_t call = ++mBindCalls;
+    const pid_t tid = getThreadId();
+
+    if (call <= 20) {
+        logAll(LogLevel::Info,
+               "[Probe 2: glBindFramebuffer] #{} tid={} target=0x{:x} fbo={}",
+               call, tid, target, framebuffer);
+    }
+
+    const size_t idx = mFrameBindCount.fetch_add(1, std::memory_order_relaxed);
+    if (idx < kMaxFrameBinds) {
+        mFrameBinds[idx] = framebuffer;
+    }
+}
+
+void LodPocMod::checkConfigReload() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - mLastConfigCheck >= std::chrono::seconds(2)) {
+        mLastConfigCheck = now;
+        std::lock_guard lock(mConfigMutex);
+        if (mConfigFile) {
+            if (mConfigFile->load()) {
+                const auto &cfg = mConfigFile->value();
+                GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceLabel);
+                CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
+            }
+        }
+    }
 }
 
 void LodPocMod::lightingTaskDetour(void *a0, void *a1, void *a2, void *a3,
@@ -558,30 +573,6 @@ void LodPocMod::lightingTaskDetour(void *a0, void *a1, void *a2, void *a3,
     }
 }
 
-void LodPocMod::bindFramebufferDetour(GLenum target, GLuint framebuffer) {
-    auto &mod = LodPocMod::instance();
-
-    // Call original first (never skip if non-null)
-    const auto orig = mod.mOriginalBindFramebuffer;
-    if (orig != nullptr) {
-        orig(target, framebuffer);
-    }
-
-    const uint64_t call = ++mod.mBindCalls;
-    const pid_t tid = getThreadId();
-
-    if (call <= 20) {
-        logAll(LogLevel::Info,
-               "[Probe 2: glBindFramebuffer] #{} tid={} target=0x{:x} fbo={}",
-               call, tid, target, framebuffer);
-    }
-
-    const size_t idx = mod.mFrameBindCount.fetch_add(1, std::memory_order_relaxed);
-    if (idx < kMaxFrameBinds) {
-        mod.mFrameBinds[idx] = framebuffer;
-    }
-}
-
 EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
     auto &mod = LodPocMod::instance();
 
@@ -591,6 +582,12 @@ EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
 
     const uint64_t frame = ++mod.mFrameCount;
     const pid_t tid = getThreadId();
+
+    // Probe A: GL frame trace & render thread tracking
+    GlTrace::instance().onSwapBuffers(frame);
+
+    // Refresh config periodically
+    mod.checkConfigReload();
 
     if (frame <= 20) {
         logAll(LogLevel::Info,
@@ -649,6 +646,9 @@ void *LodPocMod::cullPointOrChunkDetour(void *a0, void *a1, void *a2, void *a3,
                           : nullptr;
 
     const uint64_t call = ++mod.mCullCalls;
+
+    // Probe B: Camera Position Discovery snapshot
+    CameraProbe::instance().onCullCall(a0);
 
     // Optimization: only process telemetry on first 20 calls or every 4096 calls
     if (call <= 20 || (call % 4096 == 0)) {

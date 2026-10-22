@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include <pl/Config.hpp>
@@ -28,6 +29,14 @@ struct ModConfig {
 
     /** Enable background LevelDB world data reader and top-down LOD map generation */
     bool buildLodMap = true;
+
+    /** Probe A: GL Frame Trace */
+    bool traceFrame = true;
+    std::string traceLabel = "";
+
+    /** Probe B: Camera Position Discovery */
+    bool probeCameraDiff = true;
+    std::string userNote = "";
 };
 
 nlohmann::json makeDefaultConfigJson();
