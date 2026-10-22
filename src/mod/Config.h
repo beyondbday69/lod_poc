@@ -53,7 +53,7 @@ struct ModConfig {
     bool requireKnownBuild = true;
 
     /** Stage 2: Depth-tested test quad */
-    bool pocQuad = false;
+    bool pocQuad = true;
     float pocDepth = 0.5f;
     std::string pocColor = "ff00ff";
     std::string pocTrigger = "before_fbo1";
