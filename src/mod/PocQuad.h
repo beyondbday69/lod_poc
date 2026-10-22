@@ -148,6 +148,7 @@ private:
     bool mOriginRequestInitialized{false};
 
     bool mOriginValid{false};
+    bool mAutoOrigin{true};
     float mOriginX{0.0f};
     float mOriginY{0.0f};
     float mOriginZ{0.0f};

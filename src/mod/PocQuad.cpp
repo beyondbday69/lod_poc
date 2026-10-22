@@ -366,21 +366,20 @@ void PocQuad::applyPendingOrigin() {
     mLegacyAnchorWarningLogged = false;
 
     if (!mOriginValid) {
-        mCameraTracked = false;
-        mLastCameraMatches = 0;
-        if (wasValid) {
-            LodPocMod::logAll(LogLevel::Warn,
-                "[PocQuad: Origin] originValid=false; absolute camera tracking disabled; cube reverted to legacy last-chunk anchoring");
-        } else {
-            LodPocMod::logAll(LogLevel::Warn,
-                "[PocQuad: Origin] originValid=false; absolute camera tracking disabled; set originX/Y/Z and originValid=true for absolute cube anchoring");
-        }
+        mAutoOrigin = true;
+        mCameraTracked = true;
+        mTrackedCameraPos[0] = 0.0f;
+        mTrackedCameraPos[1] = 1.620f;
+        mTrackedCameraPos[2] = 0.0f;
+        LodPocMod::logAll(LogLevel::Info,
+            "[PocQuad: Origin] originValid=false; automatic relative camera tracking active (eyeHeight=+1.62; zero-config)");
         return;
     }
 
+    mAutoOrigin = false;
     mCameraTracked = true;
     mTrackedCameraPos[0] = mOriginX;
-    mTrackedCameraPos[1] = mOriginY;
+    mTrackedCameraPos[1] = mOriginY + 1.620f;
     mTrackedCameraPos[2] = mOriginZ;
 
     float sign = -1.0f;
@@ -406,12 +405,12 @@ void PocQuad::applyPendingOrigin() {
     }
 
     LodPocMod::logAll(LogLevel::Info,
-        "[PocQuad: Origin] {} origin=({:.4f}, {:.4f}, {:.4f}); camera initialized to origin; tracking prime pending{}; translationSign={:+.0f} ({})",
+        "[PocQuad: Origin] {} origin=({:.4f}, {:.4f}, {:.4f}) with eye-height (+1.62 -> cameraY={:.4f}); camera initialized; translationSign={:+.0f} ({}){}",
         changed ? "applied" : "unchanged",
-        mOriginX, mOriginY, mOriginZ,
-        detail,
+        mOriginX, mOriginY, mOriginZ, mTrackedCameraPos[1],
         mTranslationSign,
-        mSignDetected ? "auto-detected" : "default hypothesis t=16*k-camera");
+        mSignDetected ? "auto-detected" : "default hypothesis t=16*k-camera",
+        detail);
 }
 
 void PocQuad::resetAnchor(const char * /*reason*/) {
@@ -521,11 +520,11 @@ void PocQuad::logChunkStats(uint64_t frameCount) {
 }
 
 void PocQuad::updateCameraTracking(uint64_t frameCount) {
-    if (!mOriginValid || !mCameraTracked) {
+    if (!mCameraTracked) {
         return;
     }
 
-    if (!mSignDetected && !mCurrentTranslations.empty()) {
+    if (mOriginValid && !mSignDetected && !mCurrentTranslations.empty()) {
         float detectedSign = mTranslationSign;
         if (detectTranslationSign(detectedSign)) {
             mTranslationSign = detectedSign;
@@ -607,7 +606,7 @@ void PocQuad::updateCameraTracking(uint64_t frameCount) {
 }
 
 void PocQuad::logCamera(uint64_t frameCount, bool force) {
-    if (!mOriginValid || !mCameraTracked) {
+    if (!mCameraTracked) {
         return;
     }
 
@@ -618,7 +617,7 @@ void PocQuad::logCamera(uint64_t frameCount, bool force) {
     mLastCameraLogTime = now;
 
     float fractionalError = 0.0f;
-    if (!mCurrentTranslations.empty()) {
+    if (mOriginValid && !mCurrentTranslations.empty()) {
         const auto &t = mCurrentTranslations.front();
         const float observed[3] = {
             chunkmath::positiveMod16(mTranslationSign < 0.0f ? -t.x : t.x),
@@ -632,10 +631,10 @@ void PocQuad::logCamera(uint64_t frameCount, bool force) {
     }
 
     LodPocMod::logAll(LogLevel::Info,
-        "[PocQuad: Camera] frame={} absolute camera=({:.4f}, {:.4f}, {:.4f}) origin=({:.4f}, {:.4f}, {:.4f}) tracker={} matches={}/{} fractionalError={:.4f} sign={:+.0f}",
+        "[PocQuad: Camera] frame={} camera=({:.4f}, {:.4f}, {:.4f}) mode={} tracker={} matches={}/{} fractionalError={:.4f} sign={:+.0f}",
         frameCount,
         mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2],
-        mOriginX, mOriginY, mOriginZ,
+        mAutoOrigin ? "auto-relative (zero-config, eyeHeight=+1.62)" : "absolute",
         mTrackerPrimed ? "primed" : "priming",
         mLastCameraMatches, mLastCameraPreviousCount,
         fractionalError,
@@ -767,7 +766,7 @@ bool PocQuad::initCubeGL() {
         "    vec4 eyePos = uView * vec4(worldPos, 1.0);\n"
         "    gl_Position = uProj * eyePos;\n"
         "    vec3 lightDir = normalize(vec3(0.4, 0.9, 0.3));\n"
-        "    float diff = max(dot(aNormal, lightDir), 0.35);\n"
+        "    float diff = max(dot(aNormal, lightDir), 0.50);\n"
         "    vColor = aColor * diff;\n"
         "}\n";
 
@@ -866,7 +865,7 @@ bool PocQuad::initCubeGL() {
 }
 
 void PocQuad::computeCubeModelOffset(float out[3]) const {
-    if (mAbsoluteAnchor && mOriginValid && mCameraTracked) {
+    if (mAbsoluteAnchor && mCameraTracked) {
         // The shader works in camera-relative world space.  Subtract the
         // tracked camera from the fixed absolute cube position every frame.
         out[0] = mCubeAbsolutePos[0] - mTrackedCameraPos[0];
@@ -875,7 +874,7 @@ void PocQuad::computeCubeModelOffset(float out[3]) const {
         return;
     }
 
-    // Legacy camera-relative anchor (originValid=false).
+    // Legacy camera-relative anchor (originValid=false fallback).
     if (mHasChunkOffset) {
         const float deltaX = mAnchorChunkOffset[0] - mLastChunkTranslation[0];
         const float deltaY = mAnchorChunkOffset[1] - mLastChunkTranslation[1];
@@ -919,15 +918,16 @@ void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
         }
         const float dist = mPoc3dDist.load(std::memory_order_relaxed);
 
-        if (mOriginValid && mCameraTracked) {
+        if (mCameraTracked) {
             mAbsoluteAnchor = true;
             mCubeAbsolutePos[0] = mTrackedCameraPos[0] + fwdX * dist;
             mCubeAbsolutePos[1] = mTrackedCameraPos[1] + fwdY * dist;
             mCubeAbsolutePos[2] = mTrackedCameraPos[2] + fwdZ * dist;
             LodPocMod::logAll(LogLevel::Info,
-                "[PocQuad: 3D] Anchored absolute cube at world=({:.4f}, {:.4f}, {:.4f}) from camera=({:.4f}, {:.4f}, {:.4f}) dist={:.2f}",
+                "[PocQuad: 3D] Anchored world cube at ({:.4f}, {:.4f}, {:.4f}) from camera=({:.4f}, {:.4f}, {:.4f}) dist={:.2f} (mode={})",
                 mCubeAbsolutePos[0], mCubeAbsolutePos[1], mCubeAbsolutePos[2],
-                mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2], dist);
+                mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2], dist,
+                mAutoOrigin ? "auto-relative (zero-config, eyeHeight=+1.62)" : "absolute");
         } else {
             mAbsoluteAnchor = false;
             mAnchorWorldPos[0] = fwdX * dist;
@@ -1012,6 +1012,8 @@ void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
     GLboolean origCullFace = glIsEnabled(GL_CULL_FACE);
     GLint origCullMode = GL_BACK;
     glGetIntegerv(GL_CULL_FACE_MODE, &origCullMode);
+    GLint origFrontFace = GL_CCW;
+    glGetIntegerv(GL_FRONT_FACE, &origFrontFace);
 
     GLboolean origStencilTest = glIsEnabled(GL_STENCIL_TEST);
     GLboolean origColorMask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
@@ -1035,11 +1037,9 @@ void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
     glDepthRangef(0.0f, 1.0f);
 
     glDisable(GL_BLEND);
-    // Bedrock's projection matrix contains a Y flip, which reverses the
-    // screen-space winding of the cube. Render it double-sided so no face
-    // can be lost to back-face culling; depth testing still hides the far
-    // faces of this closed mesh.
-    glDisable(GL_CULL_FACE);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CCW);
     glDisable(GL_STENCIL_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
@@ -1088,6 +1088,7 @@ void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
 
     glCullFace(static_cast<GLenum>(origCullMode));
     if (origCullFace) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    glFrontFace(static_cast<GLenum>(origFrontFace));
 
     if (origStencilTest) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
     glColorMask(origColorMask[0], origColorMask[1], origColorMask[2], origColorMask[3]);
@@ -1177,6 +1178,8 @@ void PocQuad::drawQuad(GLuint targetFbo, GLenum terrainDepthFunc, bool depthInva
     GLboolean origCullFace = glIsEnabled(GL_CULL_FACE);
     GLint origCullMode = GL_BACK;
     glGetIntegerv(GL_CULL_FACE_MODE, &origCullMode);
+    GLint origFrontFace = GL_CCW;
+    glGetIntegerv(GL_FRONT_FACE, &origFrontFace);
 
     GLboolean origStencilTest = glIsEnabled(GL_STENCIL_TEST);
     GLboolean origColorMask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
@@ -1254,6 +1257,7 @@ void PocQuad::drawQuad(GLuint targetFbo, GLenum terrainDepthFunc, bool depthInva
 
     glCullFace(static_cast<GLenum>(origCullMode));
     if (origCullFace) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    glFrontFace(static_cast<GLenum>(origFrontFace));
 
     if (origStencilTest) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
     glColorMask(origColorMask[0], origColorMask[1], origColorMask[2], origColorMask[3]);
@@ -1349,16 +1353,26 @@ void PocQuad::onWorldFrame(bool inWorld, double currentFps, uint64_t frameCount)
         if (mOriginValid && !mCameraTracked) {
             mCameraTracked = true;
             mTrackedCameraPos[0] = mOriginX;
-            mTrackedCameraPos[1] = mOriginY;
+            mTrackedCameraPos[1] = mOriginY + 1.620f;
             mTrackedCameraPos[2] = mOriginZ;
             mSignDetected = false;
             mTranslationSign = -1.0f;
+            mAutoOrigin = false;
+        } else if (!mCameraTracked) {
+            mCameraTracked = true;
+            mTrackedCameraPos[0] = 0.0f;
+            mTrackedCameraPos[1] = 1.620f;
+            mTrackedCameraPos[2] = 0.0f;
+            mSignDetected = false;
+            mTranslationSign = -1.0f;
+            mAutoOrigin = true;
         }
 
         LodPocMod::logAll(LogLevel::Info,
-            "[PocQuad] world entry at frame {}: originValid={}, cameraTracked={}, currentTranslations={}, perspective={}",
+            "[PocQuad] world entry at frame {}: originValid={}, autoOrigin={}, cameraTracked={}, currentTranslations={}, perspective={}",
             frameCount,
             mOriginValid ? "true" : "false",
+            mAutoOrigin ? "true" : "false",
             mCameraTracked ? "true" : "false",
             mCurrentTranslations.size(),
             mCurrentHasPerspective ? "yes" : "no");
@@ -1383,11 +1397,11 @@ void PocQuad::onWorldFrame(bool inWorld, double currentFps, uint64_t frameCount)
             float offset[3];
             computeCubeModelOffset(offset);
             LodPocMod::logAll(LogLevel::Info,
-                "[PocQuad: 3D] Telemetry: draws={}, anchored={}, absoluteAnchor={}, originValid={}, camera=({:.2f},{:.2f},{:.2f}), cubeOffset=({:.2f},{:.2f},{:.2f}), fps={:.1f}{}",
+                "[PocQuad: 3D] Telemetry: draws={}, anchored={}, absoluteAnchor={}, originMode={}, camera=({:.2f},{:.2f},{:.2f}), cubeOffset=({:.2f},{:.2f},{:.2f}), fps={:.1f}{}",
                 mTotalDrawCount,
                 mCubeAnchored ? "true" : "false",
                 mAbsoluteAnchor ? "true" : "false",
-                mOriginValid ? "true" : "false",
+                mAutoOrigin ? "auto-relative (zero-config, eyeHeight=+1.62)" : "absolute",
                 mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2],
                 offset[0], offset[1], offset[2],
                 currentFps,
