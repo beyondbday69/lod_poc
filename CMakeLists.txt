@@ -107,12 +107,17 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/out/${CMAKE_ANDROID_ARCH
 find_library(LL_LOG_LIB log REQUIRED)
 find_library(LL_EGL_LIB EGL REQUIRED)
 find_library(LL_GLES_LIB GLESv2 REQUIRED)
+find_library(LL_Z_LIB z REQUIRED)
 
 add_library(${MOD_LIBRARY_NAME} SHARED
     src/main.cpp
     src/mod/Config.cpp
     src/mod/FileLog.cpp
-    src/mod/LodPocMod.cpp)
+    src/mod/LdbReader.cpp
+    src/mod/LodMesh.cpp
+    src/mod/LodPocMod.cpp
+    src/mod/PngWriter.cpp
+    src/mod/WorldReader.cpp)
 
 set_target_properties(${MOD_LIBRARY_NAME} PROPERTIES
     OUTPUT_NAME "${MOD_LIBRARY_NAME}")
@@ -136,6 +141,7 @@ target_link_libraries(${MOD_LIBRARY_NAME}
         ${LL_LOG_LIB}
         ${LL_EGL_LIB}
         ${LL_GLES_LIB}
+        ${LL_Z_LIB}
         nlohmann_json::nlohmann_json
         Boost::pfr
         magic_enum::magic_enum

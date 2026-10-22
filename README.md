@@ -74,3 +74,37 @@ If monitoring live from a PC:
 ```bash
 adb logcat | grep -iE "lod_poc|Probe"
 ```
+
+---
+
+## World Data Reader & Top-Down LOD Map
+
+A background world scanner runs a few seconds after `enable()` (configured via `"buildLodMap": true` in `config.json`). It analyzes the Bedrock world save on disk **without modifying game memory, hooking LevelDB, or touching the render thread**:
+
+### 1. Active World Discovery via `/proc/self/fd`
+Scans the process file descriptor table using `readlink` to discover the active world's LevelDB directory (`.../minecraftWorlds/<world_id>/db`). Because Minecraft already holds `LOCK`, the reader bypasses standard LevelDB open calls and reads the immutable `.ldb` SSTable files directly using lockless raw streams.
+
+### 2. Bedrock Chunk Parsing & Key Decoding
+- **Data3D (Tag `0x2B`)**: Extracts top-surface heightmaps (`int16_t[256]` per chunk column).
+- **SubChunk (Tag `0x2F`)**: Decompresses zlib-raw / snappy block storages, decodes little-endian NBT palettes, and samples surface block names (`minecraft:grass_block`, `stone`, `water`, `sand`, etc.).
+- **Palette Color Mapping**: Converts block names to representative terrain RGB colors (with deterministic hash fallback for custom blocks).
+
+### 3. Hierarchical LOD Tiers & Mesh Generation
+- **Tier 1**: 2x2-block cells (chunks 6–16 away)
+- **Tier 2**: 4x4-block cells (chunks 17–32 away)
+- **Tier 3**: 8x8-block cells (chunks 33–64 away)
+- **Tier 4**: 16x16-block cells (chunks 65+ away)
+- **Downsampling**: Max height + average color downsampling.
+- **Mesh Construction**: Generates low-poly heightfield tile meshes (256x256 blocks per 16x16-chunk tile) with 4-sided edge skirts that hide seams between differing LOD tiers.
+
+### 4. Debug Top-Down Map (`lod_map.png`)
+Writes an RGB top-down visualization of all discovered Overworld terrain:
+- Saved to `<mod_data_dir>/lod_map.png` and copied to `/storage/emulated/0/Download/lod_map.png`.
+- Scaled up to 1024x1024 max.
+- Displays terrain features (oceans, plains, deserts, mountains, snow, forests).
+
+### Limits & Scope
+- **Already-Generated Chunks Only**: Scans only chunk records flushed to LevelDB `.ldb` SSTables on disk.
+- **Overworld Only**: Nether and End dimensions are skipped.
+- **Offline Snapshot**: Captures world state at scan time; no live per-tick chunk streaming yet.
+- **Zero Render Overhead**: Generates mesh data and image in memory only; does not submit draw calls.

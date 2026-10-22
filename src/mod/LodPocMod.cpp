@@ -1,4 +1,5 @@
 #include "mod/LodPocMod.h"
+#include "mod/WorldReader.h"
 #include "signatures.h"
 
 #include <algorithm>
@@ -323,6 +324,18 @@ bool LodPocMod::enable() {
 
         // Install probe hooks
         installProbes();
+
+        // Trigger background LevelDB world scan if enabled
+        bool shouldScanWorld = true;
+        {
+            std::lock_guard lock(mConfigMutex);
+            if (mConfigFile) {
+                shouldScanWorld = mConfigFile->value().buildLodMap;
+            }
+        }
+        if (shouldScanWorld) {
+            WorldReader::startBackgroundScan(getSelf().getDataDir());
+        }
 
         logAll(LogLevel::Info, "LOD PoC mod enabled");
         return true;

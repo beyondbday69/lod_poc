@@ -25,6 +25,9 @@ struct ModConfig {
 
     /** Enable probe 5: LevelRendererCamera::cullPointOrChunk */
     bool probe_level_renderer_cull = true;
+
+    /** Enable background LevelDB world data reader and top-down LOD map generation */
+    bool buildLodMap = true;
 };
 
 nlohmann::json makeDefaultConfigJson();
