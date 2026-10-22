@@ -40,8 +40,10 @@ foundation; no LOD terrain is injected into the game render pass.
 - `v0.1.6` is tagged and released. Tag CI run `39764493359` passed and
   published `lod_poc.levipack` and `liblod_poc.so`:
   https://github.com/beyondbday69/lod_poc/releases/tag/v0.1.6
-- `0.1.7` is the in-world detection / camera-origin work. **Status at this
-  handoff: code complete, local Android build green, pending commit/push/CI.**
+- `0.1.7` is the in-world detection / camera-origin work, committed as
+  `37e8a15` and pushed to `main`.
+- `0.1.7` CI run `39772688073` is green (Android build, package, artifact).
+- `v0.1.7` has not been tagged yet.
 
 Files changed by `0.1.7`:
 
@@ -69,7 +71,7 @@ Files changed by `0.1.7`:
 | `v0.1.4` | `81f4b4b` … `bbd0d53` | GL frame trace, camera probe, build-id gate, SigDiag. |
 | `v0.1.5` | `3bf1cf8` | Stage 3 debug cube: double-sided rendering, depth writes, corrected winding. |
 | `v0.1.6` | `2796877` … `5a18c33` | Rewritten LevelDB reader, device verification, release assets. |
-| `v0.1.7` | pending | In-world detector fix, chunk stats, F3 camera origin, absolute cube anchor. |
+| `v0.1.7` | `37e8a15` | In-world detector fix, chunk stats, F3 camera origin, absolute cube anchor. |
 
 The cube is intentionally a temporary floating debug marker spawned in front
 of the camera at eye level. It is not LOD terrain. Do not remove it as part of
@@ -199,18 +201,18 @@ This rewrite replaces the reader end to end:
      - if false, calls `setRescanIntervalSec(0)`.
    - The call is idempotent while a worker is running and cheap when idle.
 
-4. **`LodMesh.cpp`**
+2. **`LodMesh.cpp`**
    - Missing/unresolved grid colors default to `kUnresolvedColor`.
    - Column lookup corrected to `(localX << 4) | localZ` to match the reader.
    - No game hooks or cube code touched.
 
-5. **`README.md`**
+3. **`README.md`**
    - Added `rescanIntervalSec` to the config table.
    - Added a World Reader section covering discovery timing, scan order,
      formats, colors, outputs, and rescans.
    - Added a “World Reader” log block to “What Lines to Send”.
 
-6. **`manifest.json`**
+4. **`manifest.json`**
    - Version bumped to `0.1.6`.
 
 ### 3.3 `0.1.7` — in-world detection, chunk stats, camera origin
@@ -509,13 +511,13 @@ host-only artifacts under `/tmp`.
 6. **No WAL/memtable parsing.** Only immutable `.ldb` files are read. If a
    world has only a `.log` WAL, the scan logs “No .ldb files found”. Waiting for
    the first `.ldb` is a future improvement.
-7. **Single active DB directory.** `findActiveWorldDb()` returns the first
+5. **Single active DB directory.** `findActiveWorldDb()` returns the first
    matching directory. If multiple worlds are open simultaneously, the first
    one wins.
-8. **Detached worker lifetime.** The worker is detached; if the mod is
+6. **Detached worker lifetime.** The worker is detached; if the mod is
    unloaded while it is still running, logging after unload is a theoretical
    risk. Normal app process teardown is not affected.
-9. **One-shot worker restart is config-driven.** A finished `rescanIntervalSec=0`
+7. **One-shot worker restart is config-driven.** A finished `rescanIntervalSec=0`
    worker only restarts when the config reload path sees a positive interval
    and `buildLodMap` is still true.
 10. **CRC is not validated.** The reader reads the 4-byte trailer CRC but does
@@ -695,37 +697,34 @@ claiming the release is green.
 
 ## 12. Immediate next steps
 
-1. Commit and push `0.1.7`.
-2. Wait for the GitHub Actions Android build to pass and record the run ID in
-   this handoff.
-3. Install the artifact on the device. Open a world and leave it running for at
-   least 60 frames plus the trace delay.
-4. Confirm in `lod_poc.log`:
+1. Install the `0.1.7` artifact from CI run `39772688073` on the device. Open a
+   world and leave it running for at least 60 frames plus the trace delay.
+2. Confirm in `lod_poc.log`:
    - `"world detected"` appears only after entering a world;
    - the menu does **not** produce a trace, cube, or chunk-stat lines;
    - `[PocQuad: ChunkStats]` appears every ~5 s with `distinct >= 20` and
      `perspective=yes`;
    - within each component, the first 10 `tmod16` values are equal;
    - `hypothesis=YES`.
-5. Stand still in world, copy F3 X/Y/Z into `originX/Y/Z`, set
+3. Stand still in world, copy F3 X/Y/Z into `originX/Y/Z`, set
    `originValid=true`, and wait for the 2 s reload. Confirm:
    - `[PocQuad: Origin] applied ...`;
    - `camera tracker primed ...`;
-   - `[PocQuad: Camera] absolute camera` is close to F3 X/Z (Y may differ by
-     eye height if feet coordinates were used);
+   - `[PocQuad: Camera] absolute camera` is close to F3 X/Z (Y follows the
+     value supplied, so feet coordinates stay comparable to F3 feet);
    - `translation sign auto-detected` matches the observed `tmod16`;
    - `fractionalError` is small.
-6. Walk/fly and compare the once-per-second absolute camera log with F3. If the
+4. Walk/fly and compare the once-per-second absolute camera log with F3. If the
    sign is inverted, the auto-detection should have flipped it; if
    `fractionalError` stays large, save the `ChunkStats` line and the origin
    fraction and report them.
-7. Confirm the cube stays fixed in the world with `originValid=true`, and that
+5. Confirm the cube stays fixed in the world with `originValid=true`, and that
    `[PocQuad: 3D] Anchored absolute cube` appears once after entry. With
    `originValid=false`, confirm the legacy warning and expected drift.
-8. If `"world detected"` never appears:
+6. If `"world detected"` never appears:
    - verify draws >30 and >=20 distinct chunk matrices are actually present;
    - inspect the 5 s stats only if world detection succeeds (they are gated);
    - temporarily use the trace matcher only as a diagnostic, not by reverting
      the world gate.
-9. If tracking jumps, check the `camera jumped` and `translation matching lost`
+7. If tracking jumps, check the `camera jumped` and `translation matching lost`
    warnings against F3 movement/teleports.
