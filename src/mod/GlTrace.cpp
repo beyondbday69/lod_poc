@@ -1680,6 +1680,10 @@ void GlTrace::install() {
     hookPermanent("glUniformMatrix4fv", {},
                   reinterpret_cast<void *>(&detourUniformMatrix4fv),
                   reinterpret_cast<void **>(&mOrigUniformMatrix4fv));
+
+    hookPermanent("glUseProgram", {},
+                  reinterpret_cast<void *>(&detourUseProgram),
+                  reinterpret_cast<void **>(&mOrigUseProgram));
 }
 
 void GlTrace::remove() {
@@ -1704,6 +1708,7 @@ void GlTrace::remove() {
     mOrigClear = nullptr;
     mOrigDepthFunc = nullptr;
     mOrigUniformMatrix4fv = nullptr;
+    mOrigUseProgram = nullptr;
 }
 
 void GlTrace::installHeavyHooks() {
@@ -1769,7 +1774,6 @@ void GlTrace::installHeavyHooks() {
     hookFn("glEnable", {}, reinterpret_cast<void *>(&detourEnable), reinterpret_cast<void **>(&mOrigEnable));
     hookFn("glDisable", {}, reinterpret_cast<void *>(&detourDisable), reinterpret_cast<void **>(&mOrigDisable));
     hookFn("glDepthMask", {}, reinterpret_cast<void *>(&detourDepthMask), reinterpret_cast<void **>(&mOrigDepthMask));
-    hookFn("glUseProgram", {}, reinterpret_cast<void *>(&detourUseProgram), reinterpret_cast<void **>(&mOrigUseProgram));
 
     // Stage 1: Depth, Blend, Cull, Invalidate, Uniforms & Buffers
     hookFn("glDepthRangef", {}, reinterpret_cast<void *>(&detourDepthRangef), reinterpret_cast<void **>(&mOrigDepthRangef));
@@ -1811,7 +1815,6 @@ void GlTrace::removeHeavyHooks() {
     mOrigEnable = nullptr;
     mOrigDisable = nullptr;
     mOrigDepthMask = nullptr;
-    mOrigUseProgram = nullptr;
 
     mOrigDepthRangef = nullptr;
     mOrigBlendFunc = nullptr;
