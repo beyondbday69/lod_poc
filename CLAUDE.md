@@ -28,9 +28,8 @@ foundation; no LOD terrain is injected into the game render pass.
 ## 2. Current repository state
 
 - Branch: `main`
-- Last released/tagged commit before this work: `3bf1cf8`
-  (`v0.1.5`, cube double-sided/depth fix).
-- Current handoff version: `0.1.6` (see `manifest.json`).
+- Base commit for this work: `5a18c33` (v0.1.6 device-verification docs).
+- Current handoff version: `0.1.7` (see `manifest.json`).
 - Remote: `origin` (GitHub).
 - CI: `.github/workflows/build.yml` builds with Android NDK r28c and publishes
   release assets for `v*` tags.
@@ -41,16 +40,16 @@ foundation; no LOD terrain is injected into the game render pass.
 - `v0.1.6` is tagged and released. Tag CI run `39764493359` passed and
   published `lod_poc.levipack` and `liblod_poc.so`:
   https://github.com/beyondbday69/lod_poc/releases/tag/v0.1.6
+- `0.1.7` is the in-world detection / camera-origin work. **Status at this
+  handoff: code complete, local Android build green, pending commit/push/CI.**
 
-Uncommitted-at-the-start files that were changed:
+Files changed by `0.1.7`:
 
-- `src/mod/LdbReader.h`
-- `src/mod/LdbReader.cpp`
-- `src/mod/WorldReader.h`
-- `src/mod/WorldReader.cpp`
+- `src/mod/GlTrace.h` / `src/mod/GlTrace.cpp`
+- `src/mod/PocQuad.h` / `src/mod/PocQuad.cpp`
+- `src/mod/ChunkTranslationMath.h` (new, host-testable)
 - `src/mod/Config.h`
 - `src/mod/LodPocMod.cpp`
-- `src/mod/LodMesh.cpp`
 - `README.md`
 - `manifest.json`
 - `CLAUDE.md` (this file)
@@ -69,6 +68,8 @@ Uncommitted-at-the-start files that were changed:
 | `v0.1.3` | `be3a07d` | First LevelDB reader, LOD tier mesh builder, `lod_map.png`. |
 | `v0.1.4` | `81f4b4b` … `bbd0d53` | GL frame trace, camera probe, build-id gate, SigDiag. |
 | `v0.1.5` | `3bf1cf8` | Stage 3 debug cube: double-sided rendering, depth writes, corrected winding. |
+| `v0.1.6` | `2796877` … `5a18c33` | Rewritten LevelDB reader, device verification, release assets. |
+| `v0.1.7` | pending | In-world detector fix, chunk stats, F3 camera origin, absolute cube anchor. |
 
 The cube is intentionally a temporary floating debug marker spawned in front
 of the camera at eye level. It is not LOD terrain. Do not remove it as part of
@@ -212,6 +213,89 @@ This rewrite replaces the reader end to end:
 6. **`manifest.json`**
    - Version bumped to `0.1.6`.
 
+### 3.3 `0.1.7` — in-world detection, chunk stats, camera origin
+
+The device trace showed that the old world detector (`>50` draws for 60
+frames) fired on the main menu, and the cube/trace could render there. It also
+showed that `glUniformMatrix4fv` emits identity matrices whose last column is a
+camera-relative chunk translation (for example
+`[-4.4243, -34.4406, -5.1780]`), and that every such translation has a constant
+`(t mod 16)` per component.
+
+What changed:
+
+1. **`GlTrace.h` / `GlTrace.cpp`**
+   - World state is now true only when **both** conditions hold:
+     - draws-per-frame `> 30` for 60 consecutive frames; and
+     - a perspective projection matrix plus at least 20 distinct
+       chunk-translation matrices were captured in **each of the last 30
+       frames**.
+   - Logs exactly `"world detected"` and `"world left"`. World is left after
+     condition (b) fails for 60 consecutive frames.
+   - `GlTrace::isInWorld()` gates the quad/cube detours.
+   - No main-menu trace. Manual `traceLabel` requests are deferred until world
+     detection. A trace armed but not yet recording is aborted, and its heavy
+     hooks are removed, if the world is left first.
+   - Fixed the pre-existing `setConfig()`/`armTrace()` mutex deadlock by
+     releasing `mStateMutex` before calling `armTrace()`.
+   - `remove()` resets detection history and the trace state.
+
+2. **`PocQuad.h` / `PocQuad.cpp`**
+   - Passive per-frame capture of distinct chunk translations from
+     `glUniformMatrix4fv`, before/in addition to world detection. Capture must
+     keep running outside the world so condition (b) can become true.
+   - `FrameMatrixStats PocQuad::endMatrixFrame()` finalizes the frame's
+     perspective/chunk counts; `GlTrace::onSwapBuffers()` consumes them before
+     the world decision.
+   - `onSwapBuffers()` was replaced by
+     `onWorldFrame(inWorld, fps, frameCount)`, called by `GlTrace` after the
+     world decision. All test rendering, stats, tracking, and telemetry are
+     gated on `inWorld`.
+   - Every 5 s in world, logs `[PocQuad: ChunkStats]` with:
+     - current-frame distinct count;
+     - per-component min/max;
+     - `t mod 16` for the first 10 distinct translations;
+     - `hypothesis=YES/NO` and max modulo deviation;
+     - inferred camera fraction and the applied sign.
+     There is no per-draw logging.
+   - New origin config (`originX/Y/Z`, `originValid`) is copied under a mutex
+     and applied on the render thread at the next frame boundary.
+   - When `originValid` becomes true, the camera is initialized to the origin,
+     the tracker primes on the next frame's translation set, and subsequent
+     movement is derived from the shift that maps the most previous
+     translations onto current ones (`ChunkTranslationMath.h`).
+   - Translation sign defaults to `-1` (`t = 16*k - cameraPos`) and is
+     auto-detected from the origin fraction over up to 10 translations when
+     unambiguous. `originY` is treated exactly as the camera Y even if the user
+     copied player-feet F3 coordinates.
+   - Absolute camera is logged once per second. Rate-limited warnings cover
+     lost shift matching and per-frame jumps `> 1` block.
+   - Cube anchoring:
+     - `originValid=true` + tracked camera: fixed absolute cube position,
+       model offset recomputed as `abs - camera` each frame;
+     - `originValid=false`: old last-chunk anchor retained with a one-time
+       warning about drift.
+   - Origin/disable cleanup resets the request generation so identical origin
+     values are applied again after re-enable.
+
+3. **`ChunkTranslationMath.h` (new)**
+   - `positiveMod16()`, `circularDistance16()`, `findBestShift()`.
+   - Shift candidates come from a histogram of sample-to-target differences;
+     the best candidates are scored against the full previous set with a
+     spatial hash and 0.02-block tolerance.
+   - Pure header, no GL/preloader dependencies, host-tested.
+
+4. **`Config.h` / `LodPocMod.cpp`**
+   - Added `originX`, `originY`, `originZ` (float, default `0.0`) and
+     `originValid` (bool, default `false`).
+   - Wired into both initial load and the 2 s live reload path alongside
+     `traceLabel`.
+
+5. **`README.md`**
+   - Documented the two-part in-world detector, camera-origin setup, stats-line
+     interpretation, sign/hypothesis details, warnings, cube anchoring, config
+     rows, and the exact log lines to collect.
+
 ---
 
 ## 4. Critical indexing convention
@@ -303,10 +387,58 @@ Useful log lines:
 
 ## 7. Validation performed locally
 
-There is no Android NDK in this environment, so the full mod is compiled only
-by GitHub Actions. The host-testable reader was verified directly.
+Both the `0.1.6` reader tests and the `0.1.7` Android build were run in this
+environment. CI remains the final packaging check.
 
-### Host compile
+### 0.1.7 host math test
+
+Compiled and ran a synthetic test against `ChunkTranslationMath.h`:
+
+```bash
+cd /root/lod_poc
+g++ -std=c++20 -O2 -Isrc /tmp/test_chunk_math.cpp -o /tmp/test_chunk_math
+/tmp/test_chunk_math
+```
+
+Result:
+
+```text
+found=1 matches=140 shift=(-1.2500, 0.5000, -0.7500) candidates=12
+chunk math tests passed
+```
+
+The test covers a camera movement of `(+1.25, -0.5, +0.75)` with chunks
+entering/leaving, a static camera, a too-small set, positive modulo for
+negative translations, and circular distance across the 16-block boundary.
+
+### 0.1.7 config generator
+
+Host-compiled `src/config_generator.cpp` + `src/mod/Config.cpp` against the
+local preloader/fmt/nlohmann/boost/magic_enum sources. The generated
+`config.json` and `config.schema.json` both contain `originValid` and
+`originX/Y/Z`.
+
+### 0.1.7 Android NDK build
+
+Configured and built with NDK r28c for `arm64-v8a`, Android 28:
+
+```bash
+cmake -S . -B build-android -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=/tmp/ndk/android-ndk-r28c/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+  -DFETCHCONTENT_SOURCE_DIR_PRELOADER_ANDROID=/tmp/deps/preloader_android \
+  -DFETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=/tmp/deps/nlohmann_json \
+  -DFETCHCONTENT_SOURCE_DIR_BOOST_PFR=/tmp/deps/boost_pfr \
+  -DFETCHCONTENT_SOURCE_DIR_MAGIC_ENUM=/tmp/deps/magic_enum \
+  -DFETCHCONTENT_SOURCE_DIR_FMT=/tmp/deps/fmt \
+  -DCMAKE_STRIP=/tmp/ndk/android-ndk-r28c/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
+cmake --build build-android -j2
+```
+
+Result: clean build, `out/arm64-v8a/liblod_poc.so` linked and stripped. No
+compiler warnings from the new code after fixing the mixed `&&`/`||` expression.
+
+### 0.1.6 reader host compile
 
 ```bash
 cd /root/lod_poc
@@ -361,8 +493,9 @@ host-only artifacts under `/tmp`.
 
 ## 8. Known limitations / risks
 
-1. **Android build not locally verified.** `WorldReader.cpp` depends on
-   preloader and mod headers. CI is the compile check.
+1. **Android runtime not verified for 0.1.7.** The full mod compiles locally
+   with NDK r28c, but no device has run the new world detector, chunk stats, or
+   camera tracker. CI is the final packaging check.
 2. **Direct Download write may fail** on Android 11+ scoped storage. The code
    logs the failure and still writes next to `lod_poc.log`.
 3. **Palette colors are approximate.** `getBlockColor()` maps common block
@@ -397,6 +530,33 @@ host-only artifacts under `/tmp`.
 13. **Maps only cover `.ldb` chunks.** The `.log` WAL/memtable is not parsed, so
     recently loaded/saved chunks may be missing from the map until compaction
     writes them to `.ldb`.
+
+### 0.1.7-specific limitations
+
+14. **Translation sign is a hypothesis.** The default is
+    `t = 16*k - cameraPos`, so the inferred fraction is `(-t) mod 16`. The
+    sign is auto-detected from the origin fraction when unambiguous. Verify
+    against F3 before trusting the absolute camera.
+15. **F3 origin is not necessarily the camera eye.** The mod deliberately
+    treats `originX/Y/Z` exactly as the camera position, per the request. If
+    the user copies player-feet coordinates, Y will be off by eye height.
+16. **Camera tracking has a one-frame lag.** Translation matrices are only
+    finalized at `eglSwapBuffers`, after the frame's cube draw. The cube uses
+    the previous frame's tracked camera. At normal walking speed this is
+    sub-block; it is most visible during fast flight/teleports.
+17. **Matching is geometric, not ID-based.** If the player teleports farther
+    than the visible-set overlap, or the frame has fewer than 3 matching
+    matrices/25% overlap, tracking logs a warning and holds the last camera.
+    A 16-block-aligned shift is inherently ambiguous on a full periodic grid;
+    the tracker prefers the shortest shift on ties.
+18. **Mixed lattices are reported, not corrected.** `hypothesis=NO` means the
+    captured identity-with-translation matrices do not share one `(t mod 16)`
+    value; the logger does not try to classify which ones are non-chunk.
+19. **World detection has up to a ~1 s leave delay.** The spec requires 60
+    failed matrix frames before `"world left"`. During that window the cube and
+    trace remain enabled by design.
+20. **No per-draw logging.** Chunk matrices are stored once per distinct
+    quantized translation per frame; stats are logged only every 5 s.
 
 ---
 
@@ -470,11 +630,19 @@ A real device session produced `/root/lod_poc/lod_poc.log` and
 
 ## 10. Guardrails for the next agent
 
-- **Do not touch game hooks** for world-reader work:
-  - `src/mod/GlTrace.cpp`
-  - `src/mod/PocQuad.cpp`
-  - `src/mod/CameraProbe.cpp`
+- `0.1.7` intentionally changes `src/mod/GlTrace.cpp` and
+  `src/mod/PocQuad.cpp` for in-world detection, chunk statistics, and camera
+  origin tracking. Do not revert those gates to the old draw-count-only
+  detector.
+- For **world-reader-only** work, do not change `GlTrace.cpp`,
+  `PocQuad.cpp`, or `CameraProbe.cpp`; those hooks have their own handoff
+  above.
 - Do not remove the Stage 3 debug cube; it is a separate deliverable.
+- Keep matrix capture running outside the in-world state; condition (b) needs
+  those frames to become true.
+- Keep all test rendering, trace recording, chunk stats, and camera logs gated
+  on `GlTrace::isInWorld()` / `PocQuad::mInWorld`.
+- Do not re-add a main-menu trace.
 - Do not scan the world on the render thread.
 - Do not add a dependency on a LevelDB library; the point is a standalone,
   lock-free `.ldb` reader.
@@ -516,8 +684,8 @@ Push and release:
 
 ```bash
 git push origin main
-git tag v0.1.6
-git push origin v0.1.6
+git tag v0.1.7
+git push origin v0.1.7
 ```
 
 CI publishes release assets only for `v*` tags. Check the Actions run before
@@ -527,17 +695,37 @@ claiming the release is green.
 
 ## 12. Immediate next steps
 
-1. Run a host CMake config-generator build to verify `Config.h` schema
-   generation (optional; CI also covers it).
-2. Commit and push `0.1.6`.
-3. Wait for GitHub Actions Android build to pass.
-4. Install the artifact on the device and follow Section 9.
-5. If the log still says `waiting for world...` after 15 minutes:
-   - Confirm the world was actually opened (not just the main menu).
-   - Check `/proc/self/fd` access and that the DB path contains `/db/`.
-   - Verify the game is not using a WAL-only state; wait for autosave/quit to
-     flush `.ldb` files.
-6. If the scan finds files but resolves zero columns:
-   - Check skipped SubChunk versions and parse errors first.
-   - Check whether the world uses Data2D only.
-   - Do not blindly trust Data3D; it is fallback-only.
+1. Commit and push `0.1.7`.
+2. Wait for the GitHub Actions Android build to pass and record the run ID in
+   this handoff.
+3. Install the artifact on the device. Open a world and leave it running for at
+   least 60 frames plus the trace delay.
+4. Confirm in `lod_poc.log`:
+   - `"world detected"` appears only after entering a world;
+   - the menu does **not** produce a trace, cube, or chunk-stat lines;
+   - `[PocQuad: ChunkStats]` appears every ~5 s with `distinct >= 20` and
+     `perspective=yes`;
+   - within each component, the first 10 `tmod16` values are equal;
+   - `hypothesis=YES`.
+5. Stand still in world, copy F3 X/Y/Z into `originX/Y/Z`, set
+   `originValid=true`, and wait for the 2 s reload. Confirm:
+   - `[PocQuad: Origin] applied ...`;
+   - `camera tracker primed ...`;
+   - `[PocQuad: Camera] absolute camera` is close to F3 X/Z (Y may differ by
+     eye height if feet coordinates were used);
+   - `translation sign auto-detected` matches the observed `tmod16`;
+   - `fractionalError` is small.
+6. Walk/fly and compare the once-per-second absolute camera log with F3. If the
+   sign is inverted, the auto-detection should have flipped it; if
+   `fractionalError` stays large, save the `ChunkStats` line and the origin
+   fraction and report them.
+7. Confirm the cube stays fixed in the world with `originValid=true`, and that
+   `[PocQuad: 3D] Anchored absolute cube` appears once after entry. With
+   `originValid=false`, confirm the legacy warning and expected drift.
+8. If `"world detected"` never appears:
+   - verify draws >30 and >=20 distinct chunk matrices are actually present;
+   - inspect the 5 s stats only if world detection succeeds (they are gated);
+   - temporarily use the trace matcher only as a diagnostic, not by reverting
+     the world gate.
+9. If tracking jumps, check the `camera jumped` and `translation matching lost`
+   warnings against F3 movement/teleports.

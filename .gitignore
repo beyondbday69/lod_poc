@@ -8,3 +8,4 @@ dist/
 *.so
 *.log
 *.xcrash
+lod_map.png

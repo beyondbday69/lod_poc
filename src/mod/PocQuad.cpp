@@ -3,9 +3,12 @@
 
 #include <dlfcn.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace lod_poc {
@@ -138,6 +141,60 @@ static const GLushort sCubeIndices[] = {
     20, 21, 22,  20, 22, 23   // Left (-X)
 };
 
+bool isPerspectiveMatrix(const float *m) {
+    // Kept identical to the detection used by the original PocQuad and by
+    // the GL trace matrix finder.
+    return std::abs(m[11] - (-1.0f)) < 0.1f && m[0] > 0.1f && m[5] > 0.1f;
+}
+
+bool isChunkTranslationMatrix(const float *m) {
+    // Chunk model matrices are identity matrices with a camera-relative
+    // translation in the last column.  Compare exactly, as before.
+    if (!(m[0] == 1.0f && m[5] == 1.0f && m[10] == 1.0f && m[15] == 1.0f &&
+          m[1] == 0.0f && m[2] == 0.0f && m[3] == 0.0f &&
+          m[4] == 0.0f && m[6] == 0.0f && m[7] == 0.0f &&
+          m[8] == 0.0f && m[9] == 0.0f && m[11] == 0.0f)) {
+        return false;
+    }
+    return std::abs(m[12]) > 0.1f || std::abs(m[13]) > 0.1f || std::abs(m[14]) > 0.1f;
+}
+
+int64_t quantizeTranslation(float value) {
+    // 1/1024 block is well below the precision needed for F3 comparison and
+    // avoids duplicate near-identical matrices from being counted twice.
+    return static_cast<int64_t>(std::llround(static_cast<double>(value) * 1024.0));
+}
+
+std::string formatVec3(const float v[3]) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(4)
+        << "(" << v[0] << ", " << v[1] << ", " << v[2] << ")";
+    return out.str();
+}
+
+std::string formatVec3(const chunkmath::Vec3f &v) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(4)
+        << "(" << v.x << ", " << v.y << ", " << v.z << ")";
+    return out.str();
+}
+
+std::string formatMod16Values(const std::vector<chunkmath::Vec3f> &translations,
+                              int component,
+                              size_t limit) {
+    std::ostringstream out;
+    out << '[';
+    const size_t count = std::min(limit, translations.size());
+    for (size_t i = 0; i < count; ++i) {
+        if (i != 0) out << ", ";
+        const chunkmath::Vec3f &t = translations[i];
+        const float value = (component == 0) ? t.x : ((component == 1) ? t.y : t.z);
+        out << std::fixed << std::setprecision(3) << chunkmath::positiveMod16(value);
+    }
+    out << ']';
+    return out.str();
+}
+
 } // namespace
 
 PocQuad &PocQuad::instance() {
@@ -154,13 +211,15 @@ void PocQuad::setConfig(bool enabled, float depth, const std::string &colorHex, 
     mEnabled.store(enabled, std::memory_order_relaxed);
     mDepth.store(std::clamp(depth, 0.0f, 1.0f), std::memory_order_relaxed);
 
+    const float newDist = poc3dDist > 0.5f ? poc3dDist : 8.0f;
     float oldDist = mPoc3dDist.load(std::memory_order_relaxed);
     bool old3d = mPoc3d.load(std::memory_order_relaxed);
     mPoc3d.store(poc3d, std::memory_order_relaxed);
-    mPoc3dDist.store(poc3dDist > 0.5f ? poc3dDist : 8.0f, std::memory_order_relaxed);
+    mPoc3dDist.store(newDist, std::memory_order_relaxed);
 
-    if (oldDist != poc3dDist || old3d != poc3d) {
+    if (oldDist != newDist || old3d != poc3d) {
         mCubeAnchored = false;
+        mAbsoluteAnchor = false;
     }
 
     {
@@ -173,47 +232,425 @@ void PocQuad::setConfig(bool enabled, float depth, const std::string &colorHex, 
     if (!wasEnabled && enabled) {
         mKilled.store(false, std::memory_order_relaxed);
         mCubeAnchored = false;
+        mAbsoluteAnchor = false;
         LodPocMod::logAll(LogLevel::Info,
             "[PocQuad] Enabled: 3D_Cube={}, dist={:.1f}, depth={:.3f}, color='#{}', trigger='{}'",
             poc3d ? "true" : "false", poc3dDist, depth, colorHex, trigger);
     }
 }
 
+void PocQuad::setOriginConfig(float x, float y, float z, bool valid) {
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+        LodPocMod::logAll(LogLevel::Warn,
+            "[PocQuad: Origin] WARNING: ignoring non-finite origin ({}, {}, {})", x, y, z);
+        return;
+    }
+
+    std::lock_guard lock(mOriginMutex);
+    const bool changed = !mOriginRequestInitialized ||
+                         mPendingOrigin.x != x ||
+                         mPendingOrigin.y != y ||
+                         mPendingOrigin.z != z ||
+                         mPendingOrigin.valid != valid;
+    if (!changed) {
+        return;
+    }
+
+    mPendingOrigin.x = x;
+    mPendingOrigin.y = y;
+    mPendingOrigin.z = z;
+    mPendingOrigin.valid = valid;
+    mPendingOrigin.generation = ++mOriginGenerationCounter;
+    mOriginRequestInitialized = true;
+}
+
 void PocQuad::onUniformMatrix4fv(GLuint /*program*/, GLint /*location*/, GLsizei count, GLboolean transpose, const GLfloat *value) {
     if (value == nullptr || count < 1 || transpose) return;
 
-    // Detect Projection Matrix
-    // Standard perspective: M[11] == -1.0f (or close) and M[0] > 0.1f, M[5] > 0.1f
-    if (std::abs(value[11] - (-1.0f)) < 0.1f && value[0] > 0.1f && value[5] > 0.1f) {
-        std::copy(value, value + 16, mProjMatrix);
-        mHasProjMatrix = true;
-    }
+    for (GLsizei i = 0; i < count; ++i) {
+        const float *m = value + (i * 16);
 
-    // Detect View (Rotation) Matrix:
-    // Pure 3x3 rotation: M[12]==0, M[13]==0, M[14]==0, M[15]==1.0
-    // and row lengths == 1.0
-    if (std::abs(value[12]) < 0.001f && std::abs(value[13]) < 0.001f && std::abs(value[14]) < 0.001f &&
-        std::abs(value[15] - 1.0f) < 0.001f && std::abs(value[3]) < 0.001f && std::abs(value[7]) < 0.001f) {
-        float r0 = value[0]*value[0] + value[1]*value[1] + value[2]*value[2];
-        float r1 = value[4]*value[4] + value[5]*value[5] + value[6]*value[6];
-        float r2 = value[8]*value[8] + value[9]*value[9] + value[10]*value[10];
-        if (std::abs(r0 - 1.0f) < 0.08f && std::abs(r1 - 1.0f) < 0.08f && std::abs(r2 - 1.0f) < 0.08f) {
-            std::copy(value, value + 16, mViewMatrix);
-            mHasViewMatrix = true;
+        // Detect Projection Matrix
+        // Standard perspective: M[11] == -1.0f (or close) and M[0] > 0.1f, M[5] > 0.1f
+        if (isPerspectiveMatrix(m)) {
+            std::copy(m, m + 16, mProjMatrix);
+            mHasProjMatrix = true;
+            mCaptureHasPerspective = true;
         }
-    }
 
-    // Detect Chunk Model Translation:
-    // M[0]==1, M[5]==1, M[10]==1, M[15]==1, M[1..11] == 0, M[12..14] != 0
-    if (value[0] == 1.0f && value[5] == 1.0f && value[10] == 1.0f && value[15] == 1.0f &&
-        value[1] == 0.0f && value[2] == 0.0f && value[4] == 0.0f && value[6] == 0.0f) {
-        if (std::abs(value[12]) > 0.1f || std::abs(value[13]) > 0.1f || std::abs(value[14]) > 0.1f) {
-            mChunkOffset[0] = value[12];
-            mChunkOffset[1] = value[13];
-            mChunkOffset[2] = value[14];
+        // Detect View (Rotation) Matrix:
+        // Pure 3x3 rotation: M[12]==0, M[13]==0, M[14]==0, M[15]==1.0
+        // and row lengths == 1.0
+        if (std::abs(m[12]) < 0.001f && std::abs(m[13]) < 0.001f && std::abs(m[14]) < 0.001f &&
+            std::abs(m[15] - 1.0f) < 0.001f && std::abs(m[3]) < 0.001f && std::abs(m[7]) < 0.001f) {
+            float r0 = m[0]*m[0] + m[1]*m[1] + m[2]*m[2];
+            float r1 = m[4]*m[4] + m[5]*m[5] + m[6]*m[6];
+            float r2 = m[8]*m[8] + m[9]*m[9] + m[10]*m[10];
+            if (std::abs(r0 - 1.0f) < 0.08f && std::abs(r1 - 1.0f) < 0.08f && std::abs(r2 - 1.0f) < 0.08f) {
+                std::copy(m, m + 16, mViewMatrix);
+                mHasViewMatrix = true;
+            }
+        }
+
+        // Detect Chunk Model Translation:
+        // M[0]==1, M[5]==1, M[10]==1, M[15]==1, M[1..11] == 0, M[12..14] != 0
+        if (isChunkTranslationMatrix(m)) {
+            const chunkmath::Vec3f translation{m[12], m[13], m[14]};
+            const TranslationKey key{
+                quantizeTranslation(translation.x),
+                quantizeTranslation(translation.y),
+                quantizeTranslation(translation.z),
+            };
+            if (mCaptureTranslationKeys.insert(key).second) {
+                mCaptureTranslations.push_back(translation);
+            }
+
+            // Preserve the legacy "last matrix seen" value for originValid=false.
+            mLastChunkTranslation[0] = translation.x;
+            mLastChunkTranslation[1] = translation.y;
+            mLastChunkTranslation[2] = translation.z;
             mHasChunkOffset = true;
         }
     }
+}
+
+PocQuad::FrameMatrixStats PocQuad::endMatrixFrame() {
+    FrameMatrixStats stats;
+    stats.hasPerspective = mCaptureHasPerspective;
+    stats.chunkTranslationCount = static_cast<uint32_t>(mCaptureTranslations.size());
+
+    mCurrentHasPerspective = mCaptureHasPerspective;
+    mCurrentTranslations = std::move(mCaptureTranslations);
+    mCaptureTranslations.clear();
+    mCaptureTranslationKeys.clear();
+    mCaptureHasPerspective = false;
+
+    return stats;
+}
+
+void PocQuad::applyPendingOrigin() {
+    OriginRequest request;
+    {
+        std::lock_guard lock(mOriginMutex);
+        if (mPendingOrigin.generation == mAppliedOriginGeneration) {
+            return;
+        }
+        request = mPendingOrigin;
+        mAppliedOriginGeneration = request.generation;
+    }
+
+    const bool wasValid = mOriginValid;
+    const bool changed = (!wasValid && request.valid) ||
+                         (wasValid && !request.valid) ||
+                         mOriginX != request.x ||
+                         mOriginY != request.y ||
+                         mOriginZ != request.z;
+
+    mOriginValid = request.valid;
+    mOriginX = request.x;
+    mOriginY = request.y;
+    mOriginZ = request.z;
+
+    if (!changed) {
+        return;
+    }
+
+    // The absolute cube position belongs to the old origin.  Re-anchor on the
+    // next rendered world frame.
+    mCubeAnchored = false;
+    mAbsoluteAnchor = false;
+    mTrackerPrimed = false;
+    mPreviousTranslations.clear();
+    mSignDetected = false;
+    mTranslationSign = -1.0f;
+    mLegacyAnchorWarningLogged = false;
+
+    if (!mOriginValid) {
+        mCameraTracked = false;
+        mLastCameraMatches = 0;
+        if (wasValid) {
+            LodPocMod::logAll(LogLevel::Warn,
+                "[PocQuad: Origin] originValid=false; absolute camera tracking disabled; cube reverted to legacy last-chunk anchoring");
+        } else {
+            LodPocMod::logAll(LogLevel::Warn,
+                "[PocQuad: Origin] originValid=false; absolute camera tracking disabled; set originX/Y/Z and originValid=true for absolute cube anchoring");
+        }
+        return;
+    }
+
+    mCameraTracked = true;
+    mTrackedCameraPos[0] = mOriginX;
+    mTrackedCameraPos[1] = mOriginY;
+    mTrackedCameraPos[2] = mOriginZ;
+
+    float sign = -1.0f;
+    const bool signDetected = detectTranslationSign(sign);
+    if (signDetected) {
+        mTranslationSign = sign;
+        mSignDetected = true;
+    }
+
+    std::string detail;
+    if (!mCurrentTranslations.empty()) {
+        const auto &t = mCurrentTranslations.front();
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(4)
+            << " sampleTranslation=" << formatVec3(t)
+            << " tmod16=(" << chunkmath::positiveMod16(t.x) << ", "
+            << chunkmath::positiveMod16(t.y) << ", "
+            << chunkmath::positiveMod16(t.z) << ")"
+            << " cameraFrac(-t)=(" << chunkmath::positiveMod16(-t.x) << ", "
+            << chunkmath::positiveMod16(-t.y) << ", "
+            << chunkmath::positiveMod16(-t.z) << ")";
+        detail = out.str();
+    }
+
+    LodPocMod::logAll(LogLevel::Info,
+        "[PocQuad: Origin] {} origin=({:.4f}, {:.4f}, {:.4f}); camera initialized to origin; tracking prime pending{}; translationSign={:+.0f} ({})",
+        changed ? "applied" : "unchanged",
+        mOriginX, mOriginY, mOriginZ,
+        detail,
+        mTranslationSign,
+        mSignDetected ? "auto-detected" : "default hypothesis t=16*k-camera");
+}
+
+void PocQuad::resetAnchor(const char * /*reason*/) {
+    mCubeAnchored = false;
+    mAbsoluteAnchor = false;
+}
+
+bool PocQuad::detectTranslationSign(float &sign) const {
+    if (mCurrentTranslations.empty()) {
+        return false;
+    }
+
+    float minusError = 0.0f;
+    float plusError = 0.0f;
+    const float origin[3] = {mOriginX, mOriginY, mOriginZ};
+    const size_t sampleCount = std::min<size_t>(mCurrentTranslations.size(), 10);
+    for (size_t sample = 0; sample < sampleCount; ++sample) {
+        const auto &t = mCurrentTranslations[sample];
+        const float translation[3] = {t.x, t.y, t.z};
+        for (int i = 0; i < 3; ++i) {
+            minusError += chunkmath::circularDistance16(origin[i], -translation[i]);
+            plusError += chunkmath::circularDistance16(origin[i], translation[i]);
+        }
+    }
+
+    // Do not flip the sign on an ambiguous fractional match.  The default is
+    // the hypothesis stated in the task: t = 16*k - cameraPos.
+    if (std::fabs(minusError - plusError) <= 0.02f) {
+        return false;
+    }
+
+    sign = (minusError < plusError) ? -1.0f : 1.0f;
+    return true;
+}
+
+void PocQuad::logChunkStats(uint64_t frameCount) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - mLastStatsLogTime < std::chrono::seconds(5)) {
+        return;
+    }
+    mLastStatsLogTime = now;
+
+    const size_t count = mCurrentTranslations.size();
+    if (count == 0) {
+        LodPocMod::logAll(LogLevel::Info,
+            "[PocQuad: ChunkStats] frame={} distinct=0 perspective={} min=n/a max=n/a tmod16 x=[] y=[] z=[] hypothesis=NO",
+            frameCount, mCurrentHasPerspective ? "yes" : "no");
+        return;
+    }
+
+    float minValue[3] = {
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+    };
+    float maxValue[3] = {
+        std::numeric_limits<float>::lowest(),
+        std::numeric_limits<float>::lowest(),
+        std::numeric_limits<float>::lowest(),
+    };
+
+    float maxModDeviation = 0.0f;
+    const float firstMod[3] = {
+        chunkmath::positiveMod16(mCurrentTranslations.front().x),
+        chunkmath::positiveMod16(mCurrentTranslations.front().y),
+        chunkmath::positiveMod16(mCurrentTranslations.front().z),
+    };
+
+    for (const auto &t : mCurrentTranslations) {
+        const float v[3] = {t.x, t.y, t.z};
+        for (int i = 0; i < 3; ++i) {
+            minValue[i] = std::min(minValue[i], v[i]);
+            maxValue[i] = std::max(maxValue[i], v[i]);
+            maxModDeviation = std::max(maxModDeviation,
+                chunkmath::circularDistance16(firstMod[i], v[i]));
+        }
+    }
+
+    const bool hypothesisHolds = maxModDeviation <= 0.02f;
+    const auto &first = mCurrentTranslations.front();
+    const float cameraFraction[3] = {
+        chunkmath::positiveMod16(mTranslationSign < 0.0f ? -first.x : first.x),
+        chunkmath::positiveMod16(mTranslationSign < 0.0f ? -first.y : first.y),
+        chunkmath::positiveMod16(mTranslationSign < 0.0f ? -first.z : first.z),
+    };
+
+    std::ostringstream minStr;
+    std::ostringstream maxStr;
+    minStr << std::fixed << std::setprecision(4)
+           << '(' << minValue[0] << ", " << minValue[1] << ", " << minValue[2] << ')';
+    maxStr << std::fixed << std::setprecision(4)
+           << '(' << maxValue[0] << ", " << maxValue[1] << ", " << maxValue[2] << ')';
+
+    LodPocMod::logAll(LogLevel::Info,
+        "[PocQuad: ChunkStats] frame={} distinct={} perspective={} min={} max={} tmod16 x={} y={} z={} hypothesis={} maxModDeviation={:.4f} inferredCameraFrac={} sign={:+.0f}",
+        frameCount,
+        count,
+        mCurrentHasPerspective ? "yes" : "no",
+        minStr.str(), maxStr.str(),
+        formatMod16Values(mCurrentTranslations, 0, 10),
+        formatMod16Values(mCurrentTranslations, 1, 10),
+        formatMod16Values(mCurrentTranslations, 2, 10),
+        hypothesisHolds ? "YES" : "NO",
+        maxModDeviation,
+        formatVec3(cameraFraction),
+        mTranslationSign);
+}
+
+void PocQuad::updateCameraTracking(uint64_t frameCount) {
+    if (!mOriginValid || !mCameraTracked) {
+        return;
+    }
+
+    if (!mSignDetected && !mCurrentTranslations.empty()) {
+        float detectedSign = mTranslationSign;
+        if (detectTranslationSign(detectedSign)) {
+            mTranslationSign = detectedSign;
+            mSignDetected = true;
+            LodPocMod::logAll(LogLevel::Info,
+                "[PocQuad: Origin] translation sign auto-detected from origin fraction: {:.0f} ({})",
+                mTranslationSign,
+                mTranslationSign < 0.0f ? "t = 16*k - cameraPos" : "t = 16*k + cameraPos");
+        }
+    }
+
+    if (!mTrackerPrimed) {
+        if (!mCurrentTranslations.empty()) {
+            mPreviousTranslations = mCurrentTranslations;
+            mTrackerPrimed = true;
+            LodPocMod::logAll(LogLevel::Info,
+                "[PocQuad: Origin] camera tracker primed at frame {} with {} chunk translations",
+                frameCount, mCurrentTranslations.size());
+        }
+        return;
+    }
+
+    if (mCurrentTranslations.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - mLastCameraWarnTime >= std::chrono::seconds(1)) {
+            mLastCameraWarnTime = now;
+            LodPocMod::logAll(LogLevel::Warn,
+                "[PocQuad: Camera] WARNING: translation matching lost at frame {} (current frame has no chunk translations); keeping camera at ({:.4f}, {:.4f}, {:.4f})",
+                frameCount,
+                mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2]);
+        }
+        return;
+    }
+
+    const auto match = chunkmath::findBestShift(mPreviousTranslations, mCurrentTranslations);
+    mLastCameraMatches = match.matches;
+    mLastCameraPreviousCount = match.previousCount;
+
+    if (!match.found) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - mLastCameraWarnTime >= std::chrono::seconds(1)) {
+            mLastCameraWarnTime = now;
+            LodPocMod::logAll(LogLevel::Warn,
+                "[PocQuad: Camera] WARNING: translation matching lost at frame {} (bestMatches={}, previous={}, current={}); keeping camera at ({:.4f}, {:.4f}, {:.4f})",
+                frameCount,
+                match.matches, match.previousCount, match.currentCount,
+                mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2]);
+        }
+        mPreviousTranslations = mCurrentTranslations;
+        return;
+    }
+
+    // If t = 16*k - cameraPos, a positive translation shift means the camera
+    // moved negatively.  The auto-detected sign handles the opposite
+    // convention if this build uses it.
+    const float deltaX = mTranslationSign * match.shift.x;
+    const float deltaY = mTranslationSign * match.shift.y;
+    const float deltaZ = mTranslationSign * match.shift.z;
+    const float jump = std::sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
+
+    mTrackedCameraPos[0] += deltaX;
+    mTrackedCameraPos[1] += deltaY;
+    mTrackedCameraPos[2] += deltaZ;
+
+    if (jump > 1.0f) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - mLastCameraWarnTime >= std::chrono::seconds(1)) {
+            mLastCameraWarnTime = now;
+            LodPocMod::logAll(LogLevel::Warn,
+                "[PocQuad: Camera] WARNING: camera jumped {:.4f} blocks in one frame at frame {} (shift=({:.4f}, {:.4f}, {:.4f}), matches={}/{}); new camera=({:.4f}, {:.4f}, {:.4f})",
+                jump, frameCount,
+                deltaX, deltaY, deltaZ,
+                match.matches, match.previousCount,
+                mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2]);
+        }
+    }
+
+    mPreviousTranslations = mCurrentTranslations;
+}
+
+void PocQuad::logCamera(uint64_t frameCount, bool force) {
+    if (!mOriginValid || !mCameraTracked) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - mLastCameraLogTime < std::chrono::seconds(1)) {
+        return;
+    }
+    mLastCameraLogTime = now;
+
+    float fractionalError = 0.0f;
+    if (!mCurrentTranslations.empty()) {
+        const auto &t = mCurrentTranslations.front();
+        const float observed[3] = {
+            chunkmath::positiveMod16(mTranslationSign < 0.0f ? -t.x : t.x),
+            chunkmath::positiveMod16(mTranslationSign < 0.0f ? -t.y : t.y),
+            chunkmath::positiveMod16(mTranslationSign < 0.0f ? -t.z : t.z),
+        };
+        for (int i = 0; i < 3; ++i) {
+            fractionalError = std::max(fractionalError,
+                chunkmath::circularDistance16(observed[i], mTrackedCameraPos[i]));
+        }
+    }
+
+    LodPocMod::logAll(LogLevel::Info,
+        "[PocQuad: Camera] frame={} absolute camera=({:.4f}, {:.4f}, {:.4f}) origin=({:.4f}, {:.4f}, {:.4f}) tracker={} matches={}/{} fractionalError={:.4f} sign={:+.0f}",
+        frameCount,
+        mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2],
+        mOriginX, mOriginY, mOriginZ,
+        mTrackerPrimed ? "primed" : "priming",
+        mLastCameraMatches, mLastCameraPreviousCount,
+        fractionalError,
+        mTranslationSign);
+}
+
+void PocQuad::logLegacyAnchorWarning() {
+    if (mLegacyAnchorWarningLogged) {
+        return;
+    }
+    mLegacyAnchorWarningLogged = true;
+    LodPocMod::logAll(LogLevel::Warn,
+        "[PocQuad: 3D] WARNING: originValid=false; using legacy last-chunk anchor. "
+        "The cube may drift when multiple chunk translations are visible. "
+        "Set originX/originY/originZ and originValid=true for absolute world anchoring.");
 }
 
 bool PocQuad::initGL() {
@@ -428,7 +865,33 @@ bool PocQuad::initCubeGL() {
     return true;
 }
 
+void PocQuad::computeCubeModelOffset(float out[3]) const {
+    if (mAbsoluteAnchor && mOriginValid && mCameraTracked) {
+        // The shader works in camera-relative world space.  Subtract the
+        // tracked camera from the fixed absolute cube position every frame.
+        out[0] = mCubeAbsolutePos[0] - mTrackedCameraPos[0];
+        out[1] = mCubeAbsolutePos[1] - mTrackedCameraPos[1];
+        out[2] = mCubeAbsolutePos[2] - mTrackedCameraPos[2];
+        return;
+    }
+
+    // Legacy camera-relative anchor (originValid=false).
+    if (mHasChunkOffset) {
+        const float deltaX = mAnchorChunkOffset[0] - mLastChunkTranslation[0];
+        const float deltaY = mAnchorChunkOffset[1] - mLastChunkTranslation[1];
+        const float deltaZ = mAnchorChunkOffset[2] - mLastChunkTranslation[2];
+        out[0] = mAnchorWorldPos[0] - deltaX;
+        out[1] = mAnchorWorldPos[1] - deltaY;
+        out[2] = mAnchorWorldPos[2] - deltaZ;
+    } else {
+        out[0] = mAnchorWorldPos[0];
+        out[1] = mAnchorWorldPos[1];
+        out[2] = mAnchorWorldPos[2];
+    }
+}
+
 void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
+    if (!mInWorld.load(std::memory_order_relaxed)) return;
     if (!mEnabled.load(std::memory_order_relaxed) || mKilled.load(std::memory_order_relaxed)) return;
     if (sInsideQuadRender) return;
 
@@ -443,7 +906,7 @@ void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
 
     mLastDepthFuncUsed = (terrainDepthFunc != 0 && terrainDepthFunc != GL_NEVER) ? terrainDepthFunc : GL_LEQUAL;
 
-    // Anchor cube in world space if not yet anchored
+    // Anchor the cube in world space if not yet anchored.
     if (!mCubeAnchored) {
         // Forward vector in world space from View matrix:
         // Eye forward is (0, 0, -1), so world forward = -Row 2 of View matrix = -(View[2], View[6], View[10])
@@ -454,36 +917,46 @@ void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
         if (len > 0.001f) {
             fwdX /= len; fwdY /= len; fwdZ /= len;
         }
-        float dist = mPoc3dDist.load(std::memory_order_relaxed);
-        mAnchorWorldPos[0] = fwdX * dist;
-        mAnchorWorldPos[1] = fwdY * dist;
-        mAnchorWorldPos[2] = fwdZ * dist;
+        const float dist = mPoc3dDist.load(std::memory_order_relaxed);
 
-        if (mHasChunkOffset) {
-            mAnchorChunkOffset[0] = mChunkOffset[0];
-            mAnchorChunkOffset[1] = mChunkOffset[1];
-            mAnchorChunkOffset[2] = mChunkOffset[2];
+        if (mOriginValid && mCameraTracked) {
+            mAbsoluteAnchor = true;
+            mCubeAbsolutePos[0] = mTrackedCameraPos[0] + fwdX * dist;
+            mCubeAbsolutePos[1] = mTrackedCameraPos[1] + fwdY * dist;
+            mCubeAbsolutePos[2] = mTrackedCameraPos[2] + fwdZ * dist;
+            LodPocMod::logAll(LogLevel::Info,
+                "[PocQuad: 3D] Anchored absolute cube at world=({:.4f}, {:.4f}, {:.4f}) from camera=({:.4f}, {:.4f}, {:.4f}) dist={:.2f}",
+                mCubeAbsolutePos[0], mCubeAbsolutePos[1], mCubeAbsolutePos[2],
+                mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2], dist);
+        } else {
+            mAbsoluteAnchor = false;
+            mAnchorWorldPos[0] = fwdX * dist;
+            mAnchorWorldPos[1] = fwdY * dist;
+            mAnchorWorldPos[2] = fwdZ * dist;
+            if (mHasChunkOffset) {
+                mAnchorChunkOffset[0] = mLastChunkTranslation[0];
+                mAnchorChunkOffset[1] = mLastChunkTranslation[1];
+                mAnchorChunkOffset[2] = mLastChunkTranslation[2];
+            } else {
+                mAnchorChunkOffset[0] = 0.0f;
+                mAnchorChunkOffset[1] = 0.0f;
+                mAnchorChunkOffset[2] = 0.0f;
+            }
+            LodPocMod::logAll(LogLevel::Info,
+                "[PocQuad: 3D] Anchored legacy cube at camera-relative pos=({:.4f}, {:.4f}, {:.4f}) dist={:.2f}",
+                mAnchorWorldPos[0], mAnchorWorldPos[1], mAnchorWorldPos[2], dist);
+            if (!mOriginValid) {
+                logLegacyAnchorWarning();
+            } else {
+                LodPocMod::logAll(LogLevel::Warn,
+                    "[PocQuad: 3D] WARNING: originValid=true but camera is not initialized; using legacy anchor until tracking is ready");
+            }
         }
         mCubeAnchored = true;
-        LodPocMod::logAll(LogLevel::Info,
-            "[PocQuad: 3D] Anchored 3D Cube at dist={:.1f} (fwd=[{:.2f},{:.2f},{:.2f}], pos=[{:.2f},{:.2f},{:.2f}])",
-            dist, fwdX, fwdY, fwdZ, mAnchorWorldPos[0], mAnchorWorldPos[1], mAnchorWorldPos[2]);
     }
 
-    // Calculate current model offset relative to camera
     float modelOffset[3];
-    if (mHasChunkOffset) {
-        float deltaX = mAnchorChunkOffset[0] - mChunkOffset[0];
-        float deltaY = mAnchorChunkOffset[1] - mChunkOffset[1];
-        float deltaZ = mAnchorChunkOffset[2] - mChunkOffset[2];
-        modelOffset[0] = mAnchorWorldPos[0] - deltaX;
-        modelOffset[1] = mAnchorWorldPos[1] - deltaY;
-        modelOffset[2] = mAnchorWorldPos[2] - deltaZ;
-    } else {
-        modelOffset[0] = mAnchorWorldPos[0];
-        modelOffset[1] = mAnchorWorldPos[1];
-        modelOffset[2] = mAnchorWorldPos[2];
-    }
+    computeCubeModelOffset(modelOffset);
 
     // --- SAVE ALL TOUCHED GL STATE ---
     GLint origProgram = 0;
@@ -634,6 +1107,7 @@ void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
 }
 
 void PocQuad::drawQuad(GLuint targetFbo, GLenum terrainDepthFunc, bool depthInvalidated) {
+    if (!mInWorld.load(std::memory_order_relaxed)) return;
     if (!mEnabled.load(std::memory_order_relaxed) || mKilled.load(std::memory_order_relaxed)) return;
     if (sInsideQuadRender) return;
 
@@ -799,6 +1273,7 @@ void PocQuad::drawQuad(GLuint targetFbo, GLenum terrainDepthFunc, bool depthInva
 }
 
 void PocQuad::onBindFramebufferBefore(GLuint newFbo, GLuint currentBoundFbo, uint64_t frameDraws, GLenum terrainDepthFunc, bool depthInvalidated) {
+    if (!mInWorld.load(std::memory_order_relaxed)) return;
     if (!isEnabled()) return;
     if (mDrawnThisFrame.load(std::memory_order_relaxed)) return;
 
@@ -809,9 +1284,9 @@ void PocQuad::onBindFramebufferBefore(GLuint newFbo, GLuint currentBoundFbo, uin
     }
     if (trigger != "before_fbo1") return;
 
-    // Trigger condition:
-    // Bound FBO is 0, new FBO is non-zero, frame draws >= 30 (world pass complete across all render distances)
-    if (currentBoundFbo == 0 && newFbo != 0 && frameDraws >= 30) {
+    // World-pass trigger.  The >30 threshold matches the world detector; the
+    // in-world gate is the primary protection against drawing in menus.
+    if (currentBoundFbo == 0 && newFbo != 0 && frameDraws > 30) {
         if (mPoc3d.load(std::memory_order_relaxed) && mHasProjMatrix && mHasViewMatrix) {
             drawCube(0, terrainDepthFunc);
         } else {
@@ -822,6 +1297,7 @@ void PocQuad::onBindFramebufferBefore(GLuint newFbo, GLuint currentBoundFbo, uin
 }
 
 void PocQuad::onClearAfter(GLbitfield mask, GLuint currentBoundFbo, uint64_t frameDraws, GLenum terrainDepthFunc) {
+    if (!mInWorld.load(std::memory_order_relaxed)) return;
     if (!isEnabled()) return;
     if (mDrawnThisFrame.load(std::memory_order_relaxed)) return;
 
@@ -833,8 +1309,8 @@ void PocQuad::onClearAfter(GLbitfield mask, GLuint currentBoundFbo, uint64_t fra
     if (trigger != "after_depth_clear") return;
 
     // Trigger condition:
-    // Depth clear on FBO 0 and in-world (draw counter > 0)
-    if ((mask & GL_DEPTH_BUFFER_BIT) && currentBoundFbo == 0 && frameDraws > 0) {
+    // Depth clear on FBO 0 and in-world (draw counter > 30)
+    if ((mask & GL_DEPTH_BUFFER_BIT) && currentBoundFbo == 0 && frameDraws > 30) {
         if (mPoc3d.load(std::memory_order_relaxed) && mHasProjMatrix && mHasViewMatrix) {
             drawCube(0, terrainDepthFunc);
         } else {
@@ -844,31 +1320,88 @@ void PocQuad::onClearAfter(GLbitfield mask, GLuint currentBoundFbo, uint64_t fra
     }
 }
 
-void PocQuad::onSwapBuffers(double currentFps) {
+void PocQuad::onWorldFrame(bool inWorld, double currentFps, uint64_t frameCount) {
     mDrawnThisFrame.store(false, std::memory_order_relaxed);
 
-    if (mEnabled.load(std::memory_order_relaxed) && !mKilled.load(std::memory_order_relaxed)) {
-        auto now = std::chrono::steady_clock::now();
-        if (now - mLastTelemetryTime >= std::chrono::seconds(1)) {
-            mLastTelemetryTime = now;
-            if (mPoc3d.load(std::memory_order_relaxed) && mHasProjMatrix && mHasViewMatrix) {
-                LodPocMod::logAll(LogLevel::Info,
-                    "[PocQuad: 3D] Telemetry: draws={}, anchored={}, cubePos=[{:.1f},{:.1f},{:.1f}], fps={:.1f}{}",
-                    mTotalDrawCount, mCubeAnchored ? "true" : "false",
-                    mAnchorWorldPos[0], mAnchorWorldPos[1], mAnchorWorldPos[2],
-                    currentFps,
-                    mTotalDrawCount == 0 ? " (WAITING FOR TRIGGER)" : "");
-            } else {
-                float depth = mDepth.load(std::memory_order_relaxed);
-                float ndcZ = depth * 2.0f - 1.0f;
-                LodPocMod::logAll(LogLevel::Info,
-                    "[PocQuad: 2D] Telemetry: draws={}, depth={:.3f} (NDC z={:.3f}), func={}, invalidated={}, fps={:.1f}{}",
-                    mTotalDrawCount, depth, ndcZ,
-                    depthFuncToString(mLastDepthFuncUsed),
-                    mLastDepthInvalidated ? "TRUE (WARNING: depth buffer was invalidated before draw!)" : "false",
-                    currentFps,
-                    mTotalDrawCount == 0 ? " (WAITING FOR TRIGGER)" : "");
-            }
+    const auto now = std::chrono::steady_clock::now();
+    const bool wasInWorld = mInWorld.exchange(inWorld, std::memory_order_relaxed);
+
+    // Apply config reloads on the render thread, even while outside a world.
+    applyPendingOrigin();
+
+    if (!inWorld) {
+        if (wasInWorld) {
+            resetAnchor("left world");
+            mTrackerPrimed = false;
+            mPreviousTranslations.clear();
+        }
+        return;
+    }
+
+    if (!wasInWorld) {
+        resetAnchor("entered world");
+        mTrackerPrimed = false;
+        mPreviousTranslations.clear();
+        mLastStatsLogTime = now;
+        mLastTelemetryTime = now;
+        mLastCameraLogTime = now;
+
+        if (mOriginValid && !mCameraTracked) {
+            mCameraTracked = true;
+            mTrackedCameraPos[0] = mOriginX;
+            mTrackedCameraPos[1] = mOriginY;
+            mTrackedCameraPos[2] = mOriginZ;
+            mSignDetected = false;
+            mTranslationSign = -1.0f;
+        }
+
+        LodPocMod::logAll(LogLevel::Info,
+            "[PocQuad] world entry at frame {}: originValid={}, cameraTracked={}, currentTranslations={}, perspective={}",
+            frameCount,
+            mOriginValid ? "true" : "false",
+            mCameraTracked ? "true" : "false",
+            mCurrentTranslations.size(),
+            mCurrentHasPerspective ? "yes" : "no");
+
+        if (mCameraTracked) {
+            logCamera(frameCount, true);
+        }
+    }
+
+    // Required chunk-translation statistics every 5 seconds while in world.
+    logChunkStats(frameCount);
+
+    // Camera-origin tracking is independent of whether the test quad/cube is
+    // enabled, but only runs where the world detector says we are in world.
+    updateCameraTracking(frameCount);
+    logCamera(frameCount, false);
+
+    if (mEnabled.load(std::memory_order_relaxed) && !mKilled.load(std::memory_order_relaxed) &&
+        now - mLastTelemetryTime >= std::chrono::seconds(1)) {
+        mLastTelemetryTime = now;
+        if (mPoc3d.load(std::memory_order_relaxed) && mHasProjMatrix && mHasViewMatrix) {
+            float offset[3];
+            computeCubeModelOffset(offset);
+            LodPocMod::logAll(LogLevel::Info,
+                "[PocQuad: 3D] Telemetry: draws={}, anchored={}, absoluteAnchor={}, originValid={}, camera=({:.2f},{:.2f},{:.2f}), cubeOffset=({:.2f},{:.2f},{:.2f}), fps={:.1f}{}",
+                mTotalDrawCount,
+                mCubeAnchored ? "true" : "false",
+                mAbsoluteAnchor ? "true" : "false",
+                mOriginValid ? "true" : "false",
+                mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2],
+                offset[0], offset[1], offset[2],
+                currentFps,
+                mTotalDrawCount == 0 ? " (WAITING FOR TRIGGER)" : "");
+        } else {
+            float depth = mDepth.load(std::memory_order_relaxed);
+            float ndcZ = depth * 2.0f - 1.0f;
+            LodPocMod::logAll(LogLevel::Info,
+                "[PocQuad: 2D] Telemetry: draws={}, depth={:.3f} (NDC z={:.3f}), func={}, invalidated={}, fps={:.1f}{}",
+                mTotalDrawCount, depth, ndcZ,
+                depthFuncToString(mLastDepthFuncUsed),
+                mLastDepthInvalidated ? "TRUE (WARNING: depth buffer was invalidated before draw!)" : "false",
+                currentFps,
+                mTotalDrawCount == 0 ? " (WAITING FOR TRIGGER)" : "");
         }
     }
 }
@@ -908,7 +1441,28 @@ void PocQuad::cleanup() {
         }
         mInitialized = false;
     }
+
+    mInWorld.store(false, std::memory_order_relaxed);
     mCubeAnchored = false;
+    mAbsoluteAnchor = false;
+    mCameraTracked = false;
+    mTrackerPrimed = false;
+    mOriginValid = false;
+    mCaptureTranslations.clear();
+    mCaptureTranslationKeys.clear();
+    mCaptureHasPerspective = false;
+    mCurrentTranslations.clear();
+    mPreviousTranslations.clear();
+
+    // Allow the next setOriginConfig() (including one with identical values)
+    // to be applied after disable/re-enable, when the singleton is reused.
+    {
+        std::lock_guard lock(mOriginMutex);
+        mPendingOrigin = OriginRequest{};
+        mOriginRequestInitialized = false;
+        mOriginGenerationCounter = 0;
+        mAppliedOriginGeneration = 0;
+    }
 }
 
 } // namespace lod_poc

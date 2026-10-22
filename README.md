@@ -33,8 +33,16 @@ This repository implements **log-only, non-intrusive diagnostic probes** designe
   - Summary metrics report: total draw calls, largest run of draws with depth test ON, index of first draw after last depth clear, and index where depth test is first disabled after the main 3D run (UI start candidate).
 
 ### How to Arm the Traces
-1. **Automatic Main Menu Trace**: Runs once shortly after startup (~frame 60) when menu rendering is active (`main_menu`).
-2. **Automatic In-World Trace**: The mod keeps a single permanent, cheap atomic counter hooking `glDrawElements`, `glDrawElementsInstanced`, and `glDrawArraysInstanced` with zero logging and zero allocations per frame. When draws-per-frame > 500 for 60 consecutive frames, it logs `"world detected"` and arms the `in_world` trace after `traceDelayAfterWorldSec` (default 10s), reinstalling the heavy hooks for exactly one frame to log the PASS SUMMARY before immediately removing them again.
+Traces are **in-world only**. The mod does not trace the main menu. Menu frames can exceed 30 draws, so the old draw-count-only trigger produced false positives.
+
+1. **World detection**: The mod keeps a permanent, cheap atomic counter hooking `glDrawElements`, `glDrawElementsInstanced`, and `glDrawArraysInstanced`, and passively records chunk-translation matrices from `glUniformMatrix4fv`. It declares `"world detected"` only when both conditions hold:
+   - draws-per-frame `> 30` for 60 consecutive frames; **and**
+   - a perspective projection matrix plus at least 20 distinct chunk-translation matrices were captured in each of the last 30 frames.
+
+   It logs `"world left"` when the matrix condition fails for 60 consecutive frames. Trace, test quad, and cube rendering are gated on this state.
+
+2. **Automatic In-World Trace**: After `"world detected"`, the mod waits `traceDelayAfterWorldSec` (default 10s), then arms the `in_world` trace. Heavy hooks are installed for exactly one frame, the PASS SUMMARY is dumped, and the hooks are removed again.
+
 3. **Manual Re-Arming via `config.json`**:
    Edit `<mod_data_dir>/config.json` or `<mod_config_dir>/config.json`:
    ```json
@@ -43,7 +51,7 @@ This repository implements **log-only, non-intrusive diagnostic probes** designe
      "traceLabel": "inventory"
    }
    ```
-   The mod polls config every 2 seconds. When `traceLabel` changes or is re-armed, it captures exactly one frame with that label.
+   The mod polls config every 2 seconds. When `traceLabel` changes, it captures exactly one frame with that label. If the label is set while outside a world, the request is deferred until `"world detected"` rather than tracing a menu.
 
 ---
 
@@ -100,9 +108,111 @@ In `<mod_config_dir>/config.json` (or `<mod_data_dir>/config.json`):
   "pocTrigger": "before_fbo1"
 }
 ```
-Telemetry logs once per second while active:
+Telemetry logs once per second while in world and active. Exactly one of these appears, depending on `poc3d`:
 ```text
-[PocQuad] Telemetry: draws=60, depth=0.500 (NDC z=0.000), func=LEQUAL, invalidated=false, fps=59.8
+[PocQuad: 2D] Telemetry: draws=60, depth=0.500 (NDC z=0.000), func=LEQUAL, invalidated=false, fps=59.8
+[PocQuad: 3D] Telemetry: draws=60, anchored=true, absoluteAnchor=true, originValid=true, camera=(...), cubeOffset=(...), fps=59.8
+```
+
+---
+
+## Stage 3: Camera Origin & Absolute World Anchoring
+
+### Purpose
+
+Bedrock submits chunk model matrices as identity matrices whose last column is a camera-relative chunk translation. The working hypothesis is:
+
+```text
+t = 16*k - cameraPos
+```
+
+where `t` is the translation component, `k` is the chunk lattice index, and `cameraPos` is the absolute camera position. All distinct chunk translations should therefore have the same `(t mod 16)` value for each component.
+
+The mod uses that property to:
+
+1. Log chunk-translation statistics every 5 seconds while in world.
+2. Seed an absolute camera position from an origin you copy from F3.
+3. Track movement frame-to-frame by finding the translation shift that maps most previous chunk translations onto the current frame.
+4. Keep the 3D test cube fixed at an absolute world position instead of letting it slide with the player.
+
+This remains diagnostic/log-only except for the requested cube anchoring.
+
+### Setup
+
+1. Stand still in the world and open F3. Write down the **X/Y/Z you want treated as the camera origin**, for example:
+   ```text
+   X = 123.456
+   Y = 78.900
+   Z = -45.678
+   ```
+   The mod treats these values exactly as the camera position, as requested. If you use the player-feet coordinates shown by F3, the tracked absolute Y will follow those feet coordinates, not the true eye height; the modulo/fraction check can show a constant Y offset because the chunk matrices are camera-relative.
+
+2. Put the values into `config.json` and set `originValid` to `true`:
+   ```json
+   {
+     "originX": 123.456,
+     "originY": 78.900,
+     "originZ": -45.678,
+     "originValid": true
+   }
+   ```
+   The config is reloaded every 2 seconds. The origin is applied on the render thread at the next frame boundary. Changing any origin coordinate, or toggling `originValid` off and back on, resets the tracker to the new origin.
+
+3. Confirm the origin log:
+   ```text
+   [PocQuad: Origin] applied origin=(123.4560, 78.9000, -45.6780); camera initialized to origin; ...
+   [PocQuad: Origin] camera tracker primed at frame 1234 with 87 chunk translations
+   ```
+
+4. Walk or fly for a few seconds. Once per second the mod logs:
+   ```text
+   [PocQuad: Camera] frame=... absolute camera=(...); tracker=primed matches=.../... fractionalError=... sign=-1
+   ```
+   Compare the logged camera X/Y/Z with F3. The tracked position should follow your movement. `fractionalError` near `0.000` means the chunk-fraction hypothesis agrees with the tracked position; a large value usually means the origin was entered at a different moment or the chunk convention/sign changed.
+
+5. To re-seed the camera at a new location, change one of `originX/Y/Z` while `originValid=true`, or set `originValid=false`, wait for a frame, then set it back to `true`.
+
+### Chunk statistics log
+
+Every 5 seconds while in world, the mod logs one compact line (wrapped here for readability; it is emitted as a single line). It does **not** log per draw call:
+
+```text
+[PocQuad: ChunkStats] frame=... distinct=87 perspective=yes
+  min=(-52.4243, -66.4406, -69.1780) max=(43.5757, -34.4406, -5.1780)
+  tmod16 x=[11.576, 11.576, ...] y=[13.559, 13.559, ...] z=[10.822, 10.822, ...]
+  hypothesis=YES maxModDeviation=0.0001 inferredCameraFrac=(4.4243, 2.4406, 5.1780) sign=-1
+```
+
+What to verify:
+
+- `distinct` is at least 20 during normal gameplay.
+- `perspective=yes`.
+- Within each component, the first 10 `tmod16` values should be equal (within ~0.02). `hypothesis=YES` means all distinct matrices agree, not just the first 10.
+- `inferredCameraFrac` is the camera position modulo 16 under the applied sign. The default hypothesis is `t = 16*k - cameraPos`, so it is `(-t) mod 16`; if the sign was auto-detected as `+1`, it is `t mod 16`.
+- If `hypothesis=NO`, send the line. It usually means a non-chunk identity matrix was captured, or the translation grid is not 16-aligned in this build.
+
+### Warnings
+
+The camera tracker logs a warning, rate-limited to once per second, when:
+
+- the best translation shift matches fewer than 25% of the smaller previous/current set, or fewer than 3 matrices (`translation matching lost`); the camera keeps its last known value;
+- the per-frame camera jump exceeds 1 block (`camera jumped ...`). The position is still updated because this can be a legitimate teleport or fast flight; the warning exists so you can correlate it with F3.
+
+### Cube anchoring
+
+- `originValid=true` and a primed tracker: the cube is anchored to a fixed **absolute** world position. Its camera-relative model offset is recomputed as `cubeAbsolutePos - trackedCameraPos` every frame, so it stays put while you walk.
+- `originValid=false`: the old last-chunk behavior is retained. The mod logs a warning that the cube may drift when multiple chunk translations are visible. This path uses the most recently submitted chunk translation and can jump when the game emits a different chunk last.
+
+### What lines to send for this feature
+
+```text
+[GLTrace] world detected ...
+[GLTrace] world left ...
+[PocQuad: Origin] ...
+[PocQuad: ChunkStats] ...
+[PocQuad: Camera] ...
+[PocQuad: 3D] Anchored absolute cube ...
+[PocQuad: 3D] WARNING: originValid=false; using legacy last-chunk anchor ...
 ```
 
 ---
@@ -113,15 +223,19 @@ Stored in `<mod_config_dir>/config.json` (or `<mod_data_dir>/config.json`):
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `traceFrame` | boolean | `true` | Enables single-frame GL trace. Traces `main_menu` and `in_world` automatically once. |
+| `traceFrame` | boolean | `true` | Enables single-frame GL trace. In-world automatic trace only; menu traces are not armed. |
 | `traceRaw` | boolean | `false` | When `false`, writes only the compact pass segment summary (~20 lines). When `true`, also dumps raw arguments for every draw call. |
-| `traceLabel` | string | `""` | User label for manual re-arming (e.g. set to `"inventory"` or `"paused"` to capture a specific state). |
-| `traceDelayAfterWorldSec` | integer | `10` | Delay in seconds after world detection (60 consecutive frames >500 draws) before capturing the in-world GL trace. |
-| `pocQuad` | boolean | `false` | Stage 2: Enables live depth-tested test quad rendering into FBO 0. Zero overhead when false. |
+| `traceLabel` | string | `""` | User label for manual re-arming (e.g. set to `"inventory"`). If set outside a world, the request is deferred until world detection. |
+| `traceDelayAfterWorldSec` | integer | `10` | Delay in seconds after `"world detected"` before capturing the automatic in-world GL trace. |
+| `originX` | float | `0.0` | F3 X coordinate used as the absolute camera origin. |
+| `originY` | float | `0.0` | F3 Y coordinate used as the absolute camera origin. |
+| `originZ` | float | `0.0` | F3 Z coordinate used as the absolute camera origin. |
+| `originValid` | boolean | `false` | When true, initializes the absolute camera to `originX/Y/Z` and enables absolute cube anchoring. When false, the legacy last-chunk anchor is used with a warning. |
+| `pocQuad` | boolean | `false` | Stage 2: Enables live depth-tested test quad rendering into FBO 0. Matrix capture for world detection stays active even when false. |
 | `pocDepth` | float (0..1) | `0.5` | Clip-space depth setting for test quad ($z_{NDC} = \text{depth} \times 2 - 1$). `0.0` = near plane, `1.0` = far plane. |
 | `pocColor` | string | `"ff00ff"` | Hex color string for test quad (`"rrggbb"` or `"rrggbbaa"`). Default is magenta (`#ff00ff`). |
 | `pocTrigger` | string | `"before_fbo1"` | Trigger point: `"before_fbo1"` (draw into FBO 0 immediately before switching to FBO 1) or `"after_depth_clear"` (draw immediately after `glClear(DEPTH)` on FBO 0). |
-| `poc3d` | boolean | `true` | Stage 3: When true, renders a 3D textured/shaded cube anchored in the Minecraft 3D world using the captured camera matrices. |
+| `poc3d` | boolean | `true` | When true, renders a 3D textured/shaded cube anchored in the Minecraft 3D world using the captured camera matrices. |
 | `poc3dDist` | float | `8.0` | Distance in blocks to anchor the 3D test cube in front of player camera when spawned. |
 | `probeCameraDiff` | boolean | `true` | Enables Probe B 3-snapshot memory diffing on `cullPointOrChunk`. |
 | `userNote` | string | `""` | Free-form notes with your recorded player coordinates at T1/T2/T3. |
@@ -235,7 +349,21 @@ Open `/storage/emulated/0/Download/lod_poc.log` (or retrieve via ADB) and send t
      Delta(T3-T2): ...
    ```
 
-5. **World Reader**:
+5. **World Detection, Chunk Translations, and Absolute Camera**:
+   ```text
+   [GLTrace] world detected ...
+   [GLTrace] world left ...
+   [PocQuad: Origin] applied origin=(...); camera initialized ...
+   [PocQuad: Origin] camera tracker primed ...
+   [PocQuad: ChunkStats] frame=... distinct=... perspective=yes ...
+     tmod16 x=[...] y=[...] z=[...] hypothesis=YES ...
+     inferredCameraFrac=(...) sign=...
+   [PocQuad: Camera] frame=... absolute camera=(...) ... matches=.../... fractionalError=...
+   [PocQuad: 3D] Anchored absolute cube at world=(...) from camera=(...) ...
+   ```
+   Also send any `translation matching lost`, `camera jumped`, or `originValid=false` warnings.
+
+6. **World Reader**:
    ```text
    [LOD Reader] waiting for world... polling /proc/self/fd ...
    [LOD Reader] Discovered active world DB directory: ...
@@ -279,6 +407,10 @@ Packaged artifacts:
 ## Verification & Status
 
 - **Compiles**: Cleanly builds with Android NDK r28c (Clang 17+, C++20) for `arm64-v8a`. Verified green in GitHub Actions CI.
+- **Camera-origin tracker**: Host-tested shift matching (`ChunkTranslationMath.h`) and Android NDK compilation are green. On-device verification is still required for:
+  - the translation sign (`t = 16*k - cameraPos` vs the opposite convention) on your build;
+  - whether all visible chunk matrices use the 16-block lattice in X/Y/Z;
+  - absolute cube stability while walking and the F3 comparison.
 - **Untested Parts**:
   - Exact in-world GL call order on physical Mali/Adreno driver (must be confirmed from on-device `lod_poc.log`).
   - True struct layout of `LevelRendererCamera` on Bedrock 1.26.51.1 (Probe B will reveal the exact offset from player movement diffs).

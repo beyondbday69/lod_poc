@@ -318,6 +318,7 @@ bool LodPocMod::load() {
             GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel, cfg.traceDelayAfterWorldSec);
             CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
             PocQuad::instance().setConfig(cfg.pocQuad, cfg.pocDepth, cfg.pocColor, cfg.pocTrigger, cfg.poc3d, cfg.poc3dDist);
+            PocQuad::instance().setOriginConfig(cfg.originX, cfg.originY, cfg.originZ, cfg.originValid);
         }
         logAll(LogLevel::Info, "Loaded successfully");
         return true;
@@ -634,6 +635,7 @@ void LodPocMod::checkConfigReload() {
                 GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel, cfg.traceDelayAfterWorldSec);
                 CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
                 PocQuad::instance().setConfig(cfg.pocQuad, cfg.pocDepth, cfg.pocColor, cfg.pocTrigger, cfg.poc3d, cfg.poc3dDist);
+                PocQuad::instance().setOriginConfig(cfg.originX, cfg.originY, cfg.originZ, cfg.originValid);
 
                 if (cfg.buildLodMap) {
                     WorldReader::startBackgroundScan(getSelf().getDataDir(), cfg.rescanIntervalSec);

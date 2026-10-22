@@ -39,6 +39,12 @@ struct ModConfig {
     std::string traceLabel = "";
     int traceDelayAfterWorldSec = 10;
 
+    /** Camera origin supplied from F3 for absolute chunk-translation tracking. */
+    float originX = 0.0f;
+    float originY = 0.0f;
+    float originZ = 0.0f;
+    bool originValid = false;
+
     /** Probe B: Camera Position Discovery */
     bool probeCameraDiff = true;
     std::string userNote = "";

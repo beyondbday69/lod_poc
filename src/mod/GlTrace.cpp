@@ -143,39 +143,165 @@ GlTrace &GlTrace::instance() {
 GlTrace::GlTrace() = default;
 
 void GlTrace::setConfig(bool traceFrame, bool traceRaw, const std::string &traceLabel, int traceDelayAfterWorldSec) {
-    std::lock_guard lock(mStateMutex);
-    mConfigTraceFrame = traceFrame;
-    mConfigTraceRaw = traceRaw;
-    mConfigTraceLabel = traceLabel;
-    mConfigTraceDelayAfterWorldSec = traceDelayAfterWorldSec >= 0 ? traceDelayAfterWorldSec : 10;
-    if (traceFrame && !traceLabel.empty() && traceLabel != mLastTracedLabel) {
-        armTrace(traceLabel);
+    bool shouldArm = false;
+    std::string labelToArm;
+    {
+        std::lock_guard lock(mStateMutex);
+        mConfigTraceFrame = traceFrame;
+        mConfigTraceRaw = traceRaw;
+        mConfigTraceLabel = traceLabel;
+        mConfigTraceDelayAfterWorldSec = traceDelayAfterWorldSec >= 0 ? traceDelayAfterWorldSec : 10;
+        shouldArm = traceFrame && !traceLabel.empty() && traceLabel != mLastTracedLabel;
+        labelToArm = traceLabel;
+        if (!traceFrame || traceLabel.empty()) {
+            mPendingTraceLabel.clear();
+        }
+    }
+
+    // armTrace() takes the state mutex itself, so it must be called after the
+    // config block above (calling it while holding the lock would deadlock).
+    if (shouldArm) {
+        armTrace(labelToArm);
     }
 }
 
 void GlTrace::armTrace(const std::string &label) {
-    std::lock_guard lock(mStateMutex);
-    mArmedLabel = label;
-    if (!mHeavyHooksInstalled) {
-        installHeavyHooks();
+    if (label.empty()) {
+        return;
+    }
+
+    if (!mInWorld.load(std::memory_order_relaxed)) {
+        bool logDeferred = false;
+        {
+            std::lock_guard lock(mStateMutex);
+            if (mPendingTraceLabel != label) {
+                mPendingTraceLabel = label;
+                logDeferred = true;
+            }
+        }
+        if (logDeferred) {
+            LodPocMod::logAll(LogLevel::Info,
+                "[GLTrace] Trace '{}' requested outside a world; deferred until world detected", label);
+        }
+        return;
+    }
+
+    armTraceNow(label);
+}
+
+void GlTrace::armTraceNow(const std::string &label) {
+    const TraceState state = mState.load(std::memory_order_acquire);
+    if (state == TraceState::Recording) {
+        return;
+    }
+    if (state == TraceState::Armed) {
+        // A config reload can repeat the same request while waiting for the
+        // next swap.  Keep the armed state, but let a newer label win.
+        std::lock_guard lock(mStateMutex);
+        mArmedLabel = label;
+        return;
+    }
+
+    {
+        std::lock_guard lock(mStateMutex);
+        mArmedLabel = label;
+        mPendingTraceLabel.clear();
+        if (!mHeavyHooksInstalled) {
+            installHeavyHooks();
+        }
     }
     mState.store(TraceState::Armed, std::memory_order_release);
-    LodPocMod::logAll(LogLevel::Info, "[GLTrace] Armed for single-frame trace: '{}'", label);
+    LodPocMod::logAll(LogLevel::Info, "[GLTrace] Armed for single-frame trace: '{}' (in world)", label);
+}
+
+void GlTrace::updateWorldState(uint64_t frameCount, uint64_t frameDraws,
+                               bool hasPerspective, uint32_t chunkTranslationCount,
+                               const std::chrono::steady_clock::time_point &now) {
+    const bool conditionB = hasPerspective && chunkTranslationCount >= 20;
+
+    mWorldFrameHistory.push_back(conditionB);
+    while (mWorldFrameHistory.size() > 30) {
+        mWorldFrameHistory.pop_front();
+    }
+
+    bool last30Valid = mWorldFrameHistory.size() >= 30;
+    if (last30Valid) {
+        for (bool frameValid : mWorldFrameHistory) {
+            if (!frameValid) {
+                last30Valid = false;
+                break;
+            }
+        }
+    }
+
+    if (frameDraws > 30) {
+        ++mConsecutiveDrawFrames;
+    } else {
+        mConsecutiveDrawFrames = 0;
+    }
+
+    if (!mInWorld.load(std::memory_order_relaxed)) {
+        if (mConsecutiveDrawFrames >= 60 && last30Valid) {
+            mInWorld.store(true, std::memory_order_release);
+            mWorldDetectedTime = now;
+            mConsecutiveConditionLostFrames = 0;
+            LodPocMod::logAll(LogLevel::Info,
+                "[GLTrace] world detected at frame #{}: draws>30 for {} consecutive frames, perspective+{} distinct chunk translations in each of the last {}/30 frames (current: perspective={}, distinct={}, draws={})",
+                frameCount, mConsecutiveDrawFrames,
+                chunkTranslationCount, mWorldFrameHistory.size(),
+                hasPerspective ? "yes" : "no", chunkTranslationCount, frameDraws);
+        }
+        return;
+    }
+
+    if (conditionB) {
+        mConsecutiveConditionLostFrames = 0;
+    } else {
+        ++mConsecutiveConditionLostFrames;
+    }
+
+    if (mConsecutiveConditionLostFrames >= 60) {
+        mInWorld.store(false, std::memory_order_release);
+        LodPocMod::logAll(LogLevel::Warn,
+            "[GLTrace] world left at frame #{}: in-world matrix condition failed for {} consecutive frames (current: perspective={}, distinct={}, draws={})",
+            frameCount, mConsecutiveConditionLostFrames,
+            hasPerspective ? "yes" : "no", chunkTranslationCount, frameDraws);
+        mConsecutiveDrawFrames = 0;
+        mConsecutiveConditionLostFrames = 0;
+        mWorldFrameHistory.clear();
+    }
 }
 
 void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
     const pid_t tid = gettid();
     setRenderThreadId(tid);
 
-    PocQuad::instance().onSwapBuffers(currentFps);
+    // Finalize matrix capture before the world decision so the world detector
+    // sees this frame's projection/chunk data.  This is passive bookkeeping,
+    // not test rendering; PocQuad content still only renders in world.
+    const PocQuad::FrameMatrixStats matrixStats = PocQuad::instance().endMatrixFrame();
 
     const uint64_t frameDraws = mPermanentFrameDraws.exchange(0, std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
+
+    updateWorldState(frameCount, frameDraws, matrixStats.hasPerspective,
+                     matrixStats.chunkTranslationCount, now);
+
+    const bool inWorld = mInWorld.load(std::memory_order_relaxed);
+    PocQuad::instance().onWorldFrame(inWorld, currentFps, frameCount);
 
     TraceState currentState = mState.load(std::memory_order_acquire);
 
     // If currently recording, this swap buffers marks the END of the traced frame!
     if (currentState == TraceState::Recording) {
+        if (!inWorld) {
+            mState.store(TraceState::Idle, std::memory_order_release);
+            removeHeavyHooks();
+            LodPocMod::logAll(LogLevel::Warn,
+                "[GLTrace] Trace discarded because the world detector left the world during the recorded frame; heavy hooks removed");
+            return;
+        }
+
         mState.store(TraceState::Idle, std::memory_order_release);
         std::string label = mActiveLabel;
         mLastTracedLabel = label;
@@ -192,6 +318,14 @@ void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
 
     // If armed, start recording at this frame boundary!
     if (currentState == TraceState::Armed) {
+        if (!inWorld) {
+            mState.store(TraceState::Idle, std::memory_order_release);
+            removeHeavyHooks();
+            LodPocMod::logAll(LogLevel::Warn,
+                "[GLTrace] Trace aborted because the world detector left the world before recording began; heavy hooks removed");
+            return;
+        }
+
         std::lock_guard lock(mStateMutex);
         mActiveLabel = mArmedLabel;
         mLastRecordedFps = currentFps;
@@ -214,39 +348,38 @@ void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
         return;
     }
 
-    // Check consecutive heavy frames for world detection (>50 draws)
-    if (frameDraws > 50) {
-        mConsecutiveHeavyFrames++;
-    } else {
-        mConsecutiveHeavyFrames = 0;
+    // Trace and test rendering are in-world-only.  There is deliberately no
+    // main-menu auto trace: menus can exceed 30 draws, which was the source of
+    // the earlier false in-world detection.
+    if (!inWorld || currentState != TraceState::Idle) {
+        return;
     }
 
-    if (!mWorldDetected && mConsecutiveHeavyFrames >= 60) {
-        mWorldDetected = true;
-        mWorldDetectedTime = now;
-        LodPocMod::logAll(LogLevel::Info,
-                          "[GLTrace] world detected (60 consecutive frames with >50 draws, frame #{} had {} draws). Arming in-world trace in ~{}s.",
-                          frameCount, frameDraws, mConfigTraceDelayAfterWorldSec);
+    std::string pendingLabel;
+    bool configTraceFrame = false;
+    int traceDelaySec = 10;
+    std::string configLabel;
+    {
+        std::lock_guard lock(mStateMutex);
+        pendingLabel = mPendingTraceLabel;
+        configTraceFrame = mConfigTraceFrame;
+        traceDelaySec = mConfigTraceDelayAfterWorldSec;
+        configLabel = mConfigTraceLabel;
+    }
+    if (!configTraceFrame) {
+        return;
     }
 
-    // Check automatic triggers when idle
-    if (currentState == TraceState::Idle && mConfigTraceFrame) {
-        // Trigger 1: Main menu trace (frame > 50 and at least 30 draws)
-        if (!mMainMenuTraced && frameCount > 50 && frameDraws >= 30) {
-            mMainMenuTraced = true;
-            armTrace("main_menu");
-            return;
-        }
+    if (!pendingLabel.empty()) {
+        mInWorldTraced = true;
+        armTraceNow(pendingLabel);
+        return;
+    }
 
-        // Trigger 2: In-world trace (~10s after world detected)
-        if (mWorldDetected && !mInWorldTraced) {
-            if (now >= mWorldDetectedTime + std::chrono::seconds(mConfigTraceDelayAfterWorldSec)) {
-                mInWorldTraced = true;
-                std::string label = mConfigTraceLabel.empty() ? "in_world" : mConfigTraceLabel;
-                armTrace(label);
-                return;
-            }
-        }
+    if (!mInWorldTraced &&
+        now >= mWorldDetectedTime + std::chrono::seconds(traceDelaySec)) {
+        mInWorldTraced = true;
+        armTraceNow(configLabel.empty() ? "in_world" : configLabel);
     }
 }
 
@@ -699,7 +832,7 @@ void GlTrace::detourBindFramebuffer(GLenum target, GLuint framebuffer) {
         return;
     }
 
-    if (PocQuad::instance().isEnabled()) {
+    if (inst.isInWorld() && PocQuad::instance().isEnabled()) {
         uint64_t frameDraws = inst.mPermanentFrameDraws.load(std::memory_order_relaxed);
         if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
             PocQuad::instance().onBindFramebufferBefore(framebuffer, inst.mCurrentBoundDrawFbo, frameDraws, inst.mCurrentDepthFunc, inst.mFbo0DepthInvalidated);
@@ -1091,7 +1224,7 @@ void GlTrace::detourClear(GLbitfield mask) {
 
     if (inst.mOrigClear != nullptr) inst.mOrigClear(mask);
 
-    if (PocQuad::instance().isEnabled()) {
+    if (inst.isInWorld() && PocQuad::instance().isEnabled()) {
         uint64_t frameDraws = inst.mPermanentFrameDraws.load(std::memory_order_relaxed);
         PocQuad::instance().onClearAfter(mask, inst.mCurrentBoundDrawFbo, frameDraws, inst.mCurrentDepthFunc);
     }
@@ -1228,7 +1361,7 @@ void GlTrace::detourUniformMatrix4fv(GLint location, GLsizei count, GLboolean tr
 
     if (inst.mOrigUniformMatrix4fv != nullptr) inst.mOrigUniformMatrix4fv(location, count, transpose, value);
 
-    if (value != nullptr && count > 0) {
+    if (value != nullptr && count > 0 && gettid() == inst.getRenderThreadId()) {
         PocQuad::instance().onUniformMatrix4fv(inst.mCurrentProgram, location, count, transpose, value);
     }
 
@@ -1551,6 +1684,18 @@ void GlTrace::install() {
 
 void GlTrace::remove() {
     removeHeavyHooks();
+    mInWorld.store(false, std::memory_order_relaxed);
+    mWorldFrameHistory.clear();
+    mConsecutiveDrawFrames = 0;
+    mConsecutiveConditionLostFrames = 0;
+    mInWorldTraced = false;
+    mState.store(TraceState::Idle, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(mStateMutex);
+        mPendingTraceLabel.clear();
+        mLastTracedLabel.clear();
+        mArmedLabel.clear();
+    }
     mPermanentHooks.clear();
     mOrigBindFramebuffer = nullptr;
     mOrigDrawElements = nullptr;

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -153,6 +154,8 @@ public:
     void setConfig(bool traceFrame, bool traceRaw, const std::string &traceLabel, int traceDelayAfterWorldSec = 10);
     void armTrace(const std::string &label);
     void onSwapBuffers(uint64_t frameCount, double currentFps);
+
+    bool isInWorld() const { return mInWorld.load(std::memory_order_relaxed); }
 
     void setRenderThreadId(pid_t tid) { mRenderThreadId.store(tid, std::memory_order_relaxed); }
     pid_t getRenderThreadId() const { return mRenderThreadId.load(std::memory_order_relaxed); }
@@ -307,11 +310,13 @@ private:
     std::string mConfigTraceLabel;
     std::string mLastTracedLabel;
 
-    bool mMainMenuTraced{false};
-    bool mWorldDetected{false};
+    std::atomic<bool> mInWorld{false};
     bool mInWorldTraced{false};
     bool mHeavyHooksInstalled{false};
-    uint32_t mConsecutiveHeavyFrames{0};
+    uint32_t mConsecutiveDrawFrames{0};
+    uint32_t mConsecutiveConditionLostFrames{0};
+    std::deque<bool> mWorldFrameHistory;
+    std::string mPendingTraceLabel;
     std::chrono::steady_clock::time_point mWorldDetectedTime{};
     int mConfigTraceDelayAfterWorldSec{10};
 
@@ -354,6 +359,10 @@ private:
     std::vector<pl::memory::HookHandle> mPermanentHooks;
     std::vector<pl::memory::HookHandle> mHeavyHooks;
 
+    void armTraceNow(const std::string &label);
+    void updateWorldState(uint64_t frameCount, uint64_t frameDraws,
+                          bool hasPerspective, uint32_t chunkTranslationCount,
+                          const std::chrono::steady_clock::time_point &now);
     void startNewSegment(GLuint fboId);
     void dumpPassSummary(const std::string &label);
     std::string buildAttachmentDesc(GLuint fboId);
