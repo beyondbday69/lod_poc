@@ -38,6 +38,9 @@ foundation; no LOD terrain is injected into the game render pass.
 - The first `0.1.6` CI attempt (`39762966634`) failed only on two references to
   `LdbReader::ScanState`; `ScanState` is namespace-level. Fixed in `2796877`.
 - `0.1.6` CI run `39763771134` is green (Android build, package, artifact).
+- `v0.1.6` is tagged and released. Tag CI run `39764493359` passed and
+  published `lod_poc.levipack` and `liblod_poc.so`:
+  https://github.com/beyondbday69/lod_poc/releases/tag/v0.1.6
 
 Uncommitted-at-the-start files that were changed:
 
