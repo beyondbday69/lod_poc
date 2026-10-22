@@ -14,11 +14,80 @@
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <GLES3/gl3.h>
+#include <GLES3/gl3ext.h>
 
 #include <pl/memory/Hook.hpp>
 
 namespace lod_poc {
+
+struct ClearRecord {
+    uint32_t clearIndex{0};
+    GLuint fboId{0};
+    GLbitfield mask{0};
+    float clearDepth{1.0f};
+    uint32_t drawCountBefore{0};
+};
+
+struct InvalidateRecord {
+    uint32_t callIndex{0};
+    std::string functionName;
+    GLuint fboId{0};
+    std::vector<std::string> attachments;
+    uint32_t drawCountBefore{0};
+    bool invalidatedDepth{false};
+};
+
+struct DrawRunState {
+    bool depthTest{false};
+    bool depthMask{true};
+    GLenum depthFunc{GL_LESS};
+    float depthNear{0.0f};
+    float depthFar{1.0f};
+    bool blend{false};
+    GLenum blendSrcRgb{GL_ONE};
+    GLenum blendDstRgb{GL_ZERO};
+    GLenum blendSrcAlpha{GL_ONE};
+    GLenum blendDstAlpha{GL_ZERO};
+    bool cullFace{false};
+    GLenum cullFaceMode{GL_BACK};
+    GLuint program{0};
+
+    bool operator==(const DrawRunState &o) const {
+        return depthTest == o.depthTest &&
+               depthMask == o.depthMask &&
+               depthFunc == o.depthFunc &&
+               depthNear == o.depthNear &&
+               depthFar == o.depthFar &&
+               blend == o.blend &&
+               blendSrcRgb == o.blendSrcRgb &&
+               blendDstRgb == o.blendDstRgb &&
+               blendSrcAlpha == o.blendSrcAlpha &&
+               blendDstAlpha == o.blendDstAlpha &&
+               cullFace == o.cullFace &&
+               cullFaceMode == o.cullFaceMode &&
+               program == o.program;
+    }
+};
+
+struct DrawRun {
+    uint32_t runIndex{0};
+    DrawRunState state;
+    uint32_t drawCount{0};
+    uint64_t sumVertexCount{0};
+    uint64_t sumInstanceCount{0};
+    std::string functionSummary;
+};
+
+struct MatrixCandidate {
+    GLuint program{0};
+    uint32_t drawRunIndexBefore{0};
+    std::string type; // "PROJECTION" or "VIEW-PROJECTION"
+    float fovDeg{0.0f};
+    float aspect{0.0f};
+    float values[16]{};
+};
 
 struct ImageDesc {
     GLuint id{0};
@@ -68,6 +137,7 @@ struct PassSegment {
     std::set<GLuint> distinctPrograms;
 
     std::vector<RawDrawRecord> rawDraws;
+    std::vector<DrawRun> drawRuns;
 };
 
 class GlTrace {
@@ -129,6 +199,27 @@ public:
     using GlDepthMaskFn = void (*)(GLboolean flag);
     using GlUseProgramFn = void (*)(GLuint program);
 
+    using GlDepthFuncFn = void (*)(GLenum func);
+    using GlDepthRangefFn = void (*)(GLfloat n, GLfloat f);
+    using GlBlendFuncFn = void (*)(GLenum sfactor, GLenum dfactor);
+    using GlBlendFuncSeparateFn = void (*)(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha);
+    using GlCullFaceFn = void (*)(GLenum mode);
+    using GlClearDepthfFn = void (*)(GLfloat depth);
+    using GlClearFn = void (*)(GLbitfield mask);
+
+    using GlInvalidateFramebufferFn = void (*)(GLenum target, GLsizei numAttachments, const GLenum *attachments);
+    using GlInvalidateSubFramebufferFn = void (*)(GLenum target, GLsizei numAttachments, const GLenum *attachments, GLint x, GLint y, GLsizei width, GLsizei height);
+    using GlDiscardFramebufferEXTFn = void (*)(GLenum target, GLsizei numAttachments, const GLenum *attachments);
+
+    using GlUniformMatrix4fvFn = void (*)(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+    using GlUniform4fvFn = void (*)(GLint location, GLsizei count, const GLfloat *value);
+    using GlBindBufferBaseFn = void (*)(GLenum target, GLuint index, GLuint buffer);
+    using GlBindBufferRangeFn = void (*)(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size);
+    using GlBufferSubDataFn = void (*)(GLenum target, GLintptr offset, GLsizeiptr size, const void *data);
+    using GlBufferDataFn = void (*)(GLenum target, GLsizeiptr size, const void *data, GLenum usage);
+    using GlMapBufferRangeFn = void *(*)(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access);
+    using GlUnmapBufferFn = GLboolean (*)(GLenum target);
+
     using GlDrawArraysFn = void (*)(GLenum mode, GLint first, GLsizei count);
     using GlDrawArraysInstancedFn = void (*)(GLenum mode, GLint first, GLsizei count, GLsizei instancecount);
     using GlDrawElementsFn = void (*)(GLenum mode, GLsizei count, GLenum type, const void *indices);
@@ -158,6 +249,27 @@ public:
     GlDisableFn mOrigDisable{nullptr};
     GlDepthMaskFn mOrigDepthMask{nullptr};
     GlUseProgramFn mOrigUseProgram{nullptr};
+
+    GlDepthFuncFn mOrigDepthFunc{nullptr};
+    GlDepthRangefFn mOrigDepthRangef{nullptr};
+    GlBlendFuncFn mOrigBlendFunc{nullptr};
+    GlBlendFuncSeparateFn mOrigBlendFuncSeparate{nullptr};
+    GlCullFaceFn mOrigCullFace{nullptr};
+    GlClearDepthfFn mOrigClearDepthf{nullptr};
+    GlClearFn mOrigClear{nullptr};
+
+    GlInvalidateFramebufferFn mOrigInvalidateFramebuffer{nullptr};
+    GlInvalidateSubFramebufferFn mOrigInvalidateSubFramebuffer{nullptr};
+    GlDiscardFramebufferEXTFn mOrigDiscardFramebufferEXT{nullptr};
+
+    GlUniformMatrix4fvFn mOrigUniformMatrix4fv{nullptr};
+    GlUniform4fvFn mOrigUniform4fv{nullptr};
+    GlBindBufferBaseFn mOrigBindBufferBase{nullptr};
+    GlBindBufferRangeFn mOrigBindBufferRange{nullptr};
+    GlBufferSubDataFn mOrigBufferSubData{nullptr};
+    GlBufferDataFn mOrigBufferData{nullptr};
+    GlMapBufferRangeFn mOrigMapBufferRange{nullptr};
+    GlUnmapBufferFn mOrigUnmapBuffer{nullptr};
 
     GlDrawArraysFn mOrigDrawArrays{nullptr};
     GlDrawArraysInstancedFn mOrigDrawArraysInstanced{nullptr};
@@ -210,8 +322,24 @@ private:
     GLsizei mCurrentVpW{0}, mCurrentVpH{0};
     bool mCurrentDepthTest{false};
     bool mCurrentDepthMask{true};
+    GLenum mCurrentDepthFunc{GL_LESS};
+    float mCurrentDepthNear{0.0f};
+    float mCurrentDepthFar{1.0f};
     bool mCurrentBlend{false};
+    GLenum mCurrentBlendSrcRgb{GL_ONE};
+    GLenum mCurrentBlendDstRgb{GL_ZERO};
+    GLenum mCurrentBlendSrcAlpha{GL_ONE};
+    GLenum mCurrentBlendDstAlpha{GL_ZERO};
+    bool mCurrentCullFace{false};
+    GLenum mCurrentCullFaceMode{GL_BACK};
+    float mCurrentClearDepth{1.0f};
     GLuint mCurrentProgram{0};
+
+    std::vector<ClearRecord> mClearRecords;
+    std::vector<InvalidateRecord> mInvalidateRecords;
+    bool mFbo0DepthInvalidated{false};
+    uint32_t mUniformLogCount{0};
+    std::vector<MatrixCandidate> mMatrixCandidates;
 
     std::unordered_map<GLuint, ImageDesc> mTextureMap;
     std::unordered_map<GLuint, ImageDesc> mRenderbufferMap;
@@ -244,6 +372,29 @@ private:
     static void detourDisable(GLenum cap);
     static void detourDepthMask(GLboolean flag);
     static void detourUseProgram(GLuint program);
+
+    static void detourDepthFunc(GLenum func);
+    static void detourDepthRangef(GLfloat n, GLfloat f);
+    static void detourBlendFunc(GLenum sfactor, GLenum dfactor);
+    static void detourBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha);
+    static void detourCullFace(GLenum mode);
+    static void detourClearDepthf(GLfloat depth);
+    static void detourClear(GLbitfield mask);
+
+    static void detourInvalidateFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments);
+    static void detourInvalidateSubFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments, GLint x, GLint y, GLsizei width, GLsizei height);
+    static void detourDiscardFramebufferEXT(GLenum target, GLsizei numAttachments, const GLenum *attachments);
+
+    static void detourUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+    static void detourUniform4fv(GLint location, GLsizei count, const GLfloat *value);
+    static void detourBindBufferBase(GLenum target, GLuint index, GLuint buffer);
+    static void detourBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size);
+    static void detourBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data);
+    static void detourBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage);
+    static void *detourMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access);
+    static GLboolean detourUnmapBuffer(GLenum target);
+
+    void checkMatrixCandidate(GLuint prog, uint32_t drawRunIdx, const float *m, const char *source);
 
     static void detourDrawArrays(GLenum mode, GLint first, GLsizei count);
     static void detourDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount);

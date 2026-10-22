@@ -4,6 +4,8 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <sstream>
 
 namespace lod_poc {
@@ -48,6 +50,88 @@ const char *internalFormatToString(GLenum fmt) {
         case 0x8814: return "RGBA32F";
         default:     return "UNKNOWN";
     }
+}
+
+const char *depthFuncToString(GLenum func) {
+    switch (func) {
+        case GL_NEVER:    return "NEVER";
+        case GL_LESS:     return "LESS";
+        case GL_EQUAL:    return "EQUAL";
+        case GL_LEQUAL:   return "LEQUAL";
+        case GL_GREATER:  return "GREATER";
+        case GL_NOTEQUAL: return "NOTEQUAL";
+        case GL_GEQUAL:   return "GEQUAL";
+        case GL_ALWAYS:   return "ALWAYS";
+        default:          return "UNKNOWN";
+    }
+}
+
+const char *blendFactorToString(GLenum factor) {
+    switch (factor) {
+        case GL_ZERO:                return "ZERO";
+        case GL_ONE:                 return "ONE";
+        case GL_SRC_COLOR:           return "SRC_COLOR";
+        case GL_ONE_MINUS_SRC_COLOR: return "ONE_MINUS_SRC_COLOR";
+        case GL_SRC_ALPHA:           return "SRC_ALPHA";
+        case GL_ONE_MINUS_SRC_ALPHA: return "ONE_MINUS_SRC_ALPHA";
+        case GL_DST_ALPHA:           return "DST_ALPHA";
+        case GL_ONE_MINUS_DST_ALPHA: return "ONE_MINUS_DST_ALPHA";
+        case GL_DST_COLOR:           return "DST_COLOR";
+        case GL_ONE_MINUS_DST_COLOR: return "ONE_MINUS_DST_COLOR";
+        case GL_SRC_ALPHA_SATURATE:  return "SRC_ALPHA_SATURATE";
+        default:                     return "UNKNOWN";
+    }
+}
+
+const char *cullFaceToString(GLenum mode) {
+    switch (mode) {
+        case GL_FRONT:          return "FRONT";
+        case GL_BACK:           return "BACK";
+        case GL_FRONT_AND_BACK: return "FRONT_AND_BACK";
+        default:                return "UNKNOWN";
+    }
+}
+
+std::string clearMaskToString(GLbitfield mask) {
+    std::string s;
+    if (mask & GL_COLOR_BUFFER_BIT) s += "COLOR";
+    if (mask & GL_DEPTH_BUFFER_BIT) {
+        if (!s.empty()) s += " | ";
+        s += "DEPTH";
+    }
+    if (mask & GL_STENCIL_BUFFER_BIT) {
+        if (!s.empty()) s += " | ";
+        s += "STENCIL";
+    }
+    return s.empty() ? "0" : s;
+}
+
+std::string attachmentToString(GLenum att) {
+    if (att >= GL_COLOR_ATTACHMENT0 && att <= GL_COLOR_ATTACHMENT15) {
+        return fmt::format("COLOR_ATTACHMENT{}", att - GL_COLOR_ATTACHMENT0);
+    }
+    switch (att) {
+        case GL_DEPTH_ATTACHMENT:         return "DEPTH_ATTACHMENT";
+        case GL_STENCIL_ATTACHMENT:       return "STENCIL_ATTACHMENT";
+        case 0x821A:                      return "DEPTH_STENCIL_ATTACHMENT";
+        case 0x8CD5:                      return "COLOR_ATTACHMENT0";
+        case 0x84F9:                      return "DEPTH_ATTACHMENT_EXT";
+        case 0x8D00:                      return "COLOR_ATTACHMENT0_EXT";
+        case 0x8D20:                      return "STENCIL_ATTACHMENT_EXT";
+        default:                          return fmt::format("0x{:x}", att);
+    }
+}
+
+std::string formatFloats(const float *data, size_t count, size_t maxCount = 16) {
+    size_t n = std::min(count, maxCount);
+    std::string s = "[";
+    for (size_t i = 0; i < n; ++i) {
+        if (i > 0) s += ", ";
+        s += fmt::format("{:.4f}", data[i]);
+    }
+    if (count > maxCount) s += fmt::format(", ... (total {})", count);
+    s += "]";
+    return s;
 }
 
 } // namespace
@@ -114,6 +198,11 @@ void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
         {
             std::lock_guard segLock(mFrameSegmentsMutex);
             mCurrentFrameSegments.clear();
+            mClearRecords.clear();
+            mInvalidateRecords.clear();
+            mFbo0DepthInvalidated = false;
+            mUniformLogCount = 0;
+            mMatrixCandidates.clear();
             startNewSegment(mCurrentBoundDrawFbo);
         }
 
@@ -233,6 +322,38 @@ void GlTrace::onDraw(const RawDrawRecord &record) {
         seg.distinctPrograms.insert(mCurrentProgram);
     }
 
+    // Draw run tracking (collapse consecutive draws with identical state)
+    DrawRunState currentState;
+    currentState.depthTest = mCurrentDepthTest;
+    currentState.depthMask = mCurrentDepthMask;
+    currentState.depthFunc = mCurrentDepthFunc;
+    currentState.depthNear = mCurrentDepthNear;
+    currentState.depthFar = mCurrentDepthFar;
+    currentState.blend = mCurrentBlend;
+    currentState.blendSrcRgb = mCurrentBlendSrcRgb;
+    currentState.blendDstRgb = mCurrentBlendDstRgb;
+    currentState.blendSrcAlpha = mCurrentBlendSrcAlpha;
+    currentState.blendDstAlpha = mCurrentBlendDstAlpha;
+    currentState.cullFace = mCurrentCullFace;
+    currentState.cullFaceMode = mCurrentCullFaceMode;
+    currentState.program = mCurrentProgram;
+
+    if (!seg.drawRuns.empty() && seg.drawRuns.back().state == currentState) {
+        auto &run = seg.drawRuns.back();
+        run.drawCount++;
+        run.sumVertexCount += vCount;
+        run.sumInstanceCount += static_cast<uint64_t>(record.instanceCount);
+    } else {
+        DrawRun newRun;
+        newRun.runIndex = static_cast<uint32_t>(seg.drawRuns.size() + 1);
+        newRun.state = currentState;
+        newRun.drawCount = 1;
+        newRun.sumVertexCount = vCount;
+        newRun.sumInstanceCount = static_cast<uint64_t>(record.instanceCount);
+        newRun.functionSummary = record.functionName;
+        seg.drawRuns.push_back(newRun);
+    }
+
     if (mConfigTraceRaw) {
         seg.rawDraws.push_back(record);
     }
@@ -317,6 +438,112 @@ void GlTrace::dumpPassSummary(const std::string &label) {
         }
     } else {
         LodPocMod::logAll(LogLevel::Info, "No segments found with DepthTest ON and draw calls > 0.");
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 1d: Full Pass Segment Breakdown (Before / At / After FBO 1)
+    // -------------------------------------------------------------------------
+    LodPocMod::logAll(LogLevel::Info, "--- FULL PASS SEGMENT BREAKDOWN ---");
+    bool seenNonZeroFbo = false;
+    for (const auto &seg : mCurrentFrameSegments) {
+        if (seg.fboId != 0) seenNonZeroFbo = true;
+        std::string role = "FBO 0 Pass";
+        if (seg.fboId != 0) {
+            role = fmt::format("Offscreen FBO {} Pass", seg.fboId);
+        } else if (!seenNonZeroFbo) {
+            if (seg.totalDrawCalls > 500) role = "Main 3D World Pass (Pre-FBO1)";
+            else if (seg.totalDrawCalls > 0) role = "Early Sky / Clear Pass (Pre-FBO1)";
+            else role = "Setup / Target Pass (Pre-FBO1)";
+        } else {
+            role = "Post-Processing / 2D UI Pass (Post-FBO1)";
+        }
+
+        LodPocMod::logAll(LogLevel::Info,
+            "  Segment #{:2d}: FBO {:2d} | Viewport: [{:4d}, {:4d}, {:4d}x{:4d}] | Draws: {:4d} | Verts: {:8d} | Role: [{}]",
+            seg.segmentIndex, seg.fboId, seg.vpX, seg.vpY, seg.vpW, seg.vpH,
+            seg.totalDrawCalls, seg.sumVertexCount, role);
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 1a: Draw Runs for the Big FBO 0 Segment (First 80 Runs)
+    // -------------------------------------------------------------------------
+    const PassSegment *bigFbo0 = nullptr;
+    for (const auto &seg : mCurrentFrameSegments) {
+        if (seg.fboId == 0) {
+            if (!bigFbo0 || seg.totalDrawCalls > bigFbo0->totalDrawCalls) {
+                bigFbo0 = &seg;
+            }
+        }
+    }
+
+    if (bigFbo0 != nullptr && !bigFbo0->drawRuns.empty()) {
+        size_t showCount = std::min<size_t>(80, bigFbo0->drawRuns.size());
+        LodPocMod::logAll(LogLevel::Info,
+            "--- DRAW RUNS: Segment #{} (Big FBO-0 Terrain Segment, Total Runs={}, Showing First {}) ---",
+            bigFbo0->segmentIndex, bigFbo0->drawRuns.size(), showCount);
+        for (size_t r = 0; r < showCount; ++r) {
+            const auto &run = bigFbo0->drawRuns[r];
+            const auto &st = run.state;
+            LodPocMod::logAll(LogLevel::Info,
+                "  Run #{:2d}: Draws={:4d} | Verts={:7d} | Prog={:3d} | DepthTest={} | DepthMask={} | DepthFunc={} | DepthRange=[{:.2f}, {:.2f}] | Blend={} (SrcRGB={}, DstRGB={}) | Cull={} ({}) | Func={}",
+                run.runIndex, run.drawCount, run.sumVertexCount, st.program,
+                st.depthTest ? "ON " : "OFF",
+                st.depthMask ? "ON " : "OFF",
+                depthFuncToString(st.depthFunc),
+                st.depthNear, st.depthFar,
+                st.blend ? "ON " : "OFF",
+                blendFactorToString(st.blendSrcRgb), blendFactorToString(st.blendDstRgb),
+                st.cullFace ? "ON " : "OFF", cullFaceToString(st.cullFaceMode),
+                run.functionSummary);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 1a: GL Clear Events
+    // -------------------------------------------------------------------------
+    LodPocMod::logAll(LogLevel::Info, "--- GL CLEAR EVENTS IN TRACED FRAME ---");
+    if (mClearRecords.empty()) {
+        LodPocMod::logAll(LogLevel::Info, "  (No glClear calls intercepted)");
+    } else {
+        for (const auto &c : mClearRecords) {
+            LodPocMod::logAll(LogLevel::Info,
+                "  Clear #{:2d}: FBO {:2d} | Mask=0x{:04x} ({}) | ClearDepth={:.4f} | Before Draw #{:4d}",
+                c.clearIndex, c.fboId, c.mask, clearMaskToString(c.mask), c.clearDepth, c.drawCountBefore);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 1b: Framebuffer Invalidate & Discard Events
+    // -------------------------------------------------------------------------
+    LodPocMod::logAll(LogLevel::Info, "--- FRAMEBUFFER INVALIDATE / DISCARD EVENTS ---");
+    if (mInvalidateRecords.empty()) {
+        LodPocMod::logAll(LogLevel::Info, "  (No glInvalidateFramebuffer or glDiscardFramebufferEXT calls intercepted)");
+    } else {
+        for (const auto &inv : mInvalidateRecords) {
+            std::string attStr;
+            for (const auto &a : inv.attachments) {
+                if (!attStr.empty()) attStr += ", ";
+                attStr += a;
+            }
+            LodPocMod::logAll(LogLevel::Info,
+                "  Invalidate #{:2d}: {} on FBO {:2d} | Attachments: [{}] | Before Draw #{:4d}{}",
+                inv.callIndex, inv.functionName, inv.fboId, attStr, inv.drawCountBefore,
+                inv.invalidatedDepth ? " (DEPTH BUFFER INVALIDATED!)" : "");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 1c: Candidate Perspective & View-Projection Matrices
+    // -------------------------------------------------------------------------
+    LodPocMod::logAll(LogLevel::Info, "--- MATRIX FINDER CANDIDATES SUMMARY ---");
+    if (mMatrixCandidates.empty()) {
+        LodPocMod::logAll(LogLevel::Info, "  (No candidate projection or view-projection matrices detected)");
+    } else {
+        for (const auto &mc : mMatrixCandidates) {
+            LodPocMod::logAll(LogLevel::Info,
+                "  [MatrixCandidate] Type: {} | Program: {:3d} | Before Draw Run #{:2d}: fov={:.1f} deg, aspect={:.3f}",
+                mc.type, mc.program, mc.drawRunIndexBefore, mc.fovDeg, mc.aspect);
+        }
     }
 
     LodPocMod::logAll(LogLevel::Info, "============================================================");
@@ -443,11 +670,13 @@ void GlTrace::onViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
 void GlTrace::onEnable(GLenum cap) {
     if (cap == 0x0B71 /* GL_DEPTH_TEST */) mCurrentDepthTest = true;
     else if (cap == 0x0BE2 /* GL_BLEND */) mCurrentBlend = true;
+    else if (cap == 0x0B44 /* GL_CULL_FACE */) mCurrentCullFace = true;
 }
 
 void GlTrace::onDisable(GLenum cap) {
     if (cap == 0x0B71 /* GL_DEPTH_TEST */) mCurrentDepthTest = false;
     else if (cap == 0x0BE2 /* GL_BLEND */) mCurrentBlend = false;
+    else if (cap == 0x0B44 /* GL_CULL_FACE */) mCurrentCullFace = false;
 }
 
 void GlTrace::onDepthMask(GLboolean flag) {
@@ -728,7 +957,434 @@ void GlTrace::detourMultiDrawElementsEXT(GLenum mode, const GLsizei *count, GLen
 }
 
 // -----------------------------------------------------------------------------
-// Lifecycle & Hook Installation
+// Stage 1: Additional Detour Implementations
+// -----------------------------------------------------------------------------
+
+void GlTrace::detourDepthFunc(GLenum func) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDepthFunc != nullptr) inst.mOrigDepthFunc(func);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+    inst.mCurrentDepthFunc = func;
+}
+
+void GlTrace::detourDepthRangef(GLfloat n, GLfloat f) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDepthRangef != nullptr) inst.mOrigDepthRangef(n, f);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+    inst.mCurrentDepthNear = n;
+    inst.mCurrentDepthFar = f;
+}
+
+void GlTrace::detourBlendFunc(GLenum sfactor, GLenum dfactor) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigBlendFunc != nullptr) inst.mOrigBlendFunc(sfactor, dfactor);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+    inst.mCurrentBlendSrcRgb = sfactor;
+    inst.mCurrentBlendDstRgb = dfactor;
+    inst.mCurrentBlendSrcAlpha = sfactor;
+    inst.mCurrentBlendDstAlpha = dfactor;
+}
+
+void GlTrace::detourBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigBlendFuncSeparate != nullptr) inst.mOrigBlendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+    inst.mCurrentBlendSrcRgb = srcRGB;
+    inst.mCurrentBlendDstRgb = dstRGB;
+    inst.mCurrentBlendSrcAlpha = srcAlpha;
+    inst.mCurrentBlendDstAlpha = dstAlpha;
+}
+
+void GlTrace::detourCullFace(GLenum mode) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigCullFace != nullptr) inst.mOrigCullFace(mode);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+    inst.mCurrentCullFaceMode = mode;
+}
+
+void GlTrace::detourClearDepthf(GLfloat depth) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigClearDepthf != nullptr) inst.mOrigClearDepthf(depth);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+    inst.mCurrentClearDepth = depth;
+}
+
+void GlTrace::detourClear(GLbitfield mask) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigClear != nullptr) inst.mOrigClear(mask);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+
+    ClearRecord cr;
+    cr.clearIndex = static_cast<uint32_t>(inst.mClearRecords.size() + 1);
+    cr.fboId = inst.mCurrentBoundDrawFbo;
+    cr.mask = mask;
+    cr.clearDepth = inst.mCurrentClearDepth;
+    cr.drawCountBefore = static_cast<uint32_t>(inst.mPermanentFrameDraws.load(std::memory_order_relaxed));
+    inst.mClearRecords.push_back(cr);
+
+    LodPocMod::logAll(LogLevel::Info,
+        "[GLTrace: Clear] glClear(mask=0x{:04x} [{}]) on FBO {} (clearDepth={:.4f}) at frame draw #{}",
+        mask, clearMaskToString(mask), inst.mCurrentBoundDrawFbo, inst.mCurrentClearDepth, cr.drawCountBefore);
+}
+
+void GlTrace::detourInvalidateFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigInvalidateFramebuffer != nullptr) inst.mOrigInvalidateFramebuffer(target, numAttachments, attachments);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+
+    InvalidateRecord ir;
+    ir.callIndex = static_cast<uint32_t>(inst.mInvalidateRecords.size() + 1);
+    ir.functionName = "glInvalidateFramebuffer";
+    ir.fboId = inst.mCurrentBoundDrawFbo;
+    ir.drawCountBefore = static_cast<uint32_t>(inst.mPermanentFrameDraws.load(std::memory_order_relaxed));
+    ir.invalidatedDepth = false;
+
+    std::string attStr;
+    if (attachments != nullptr) {
+        for (GLsizei i = 0; i < numAttachments; ++i) {
+            std::string name = attachmentToString(attachments[i]);
+            ir.attachments.push_back(name);
+            if (!attStr.empty()) attStr += ", ";
+            attStr += name;
+            if (attachments[i] == GL_DEPTH_ATTACHMENT || attachments[i] == 0x821A || attachments[i] == 0x84F9) {
+                ir.invalidatedDepth = true;
+                if (inst.mCurrentBoundDrawFbo == 0) {
+                    inst.mFbo0DepthInvalidated = true;
+                }
+            }
+        }
+    }
+    inst.mInvalidateRecords.push_back(ir);
+
+    LodPocMod::logAll(LogLevel::Info,
+        "[GLTrace: Invalidate] glInvalidateFramebuffer(target=0x{:x}, count={}) on FBO {} with attachments: [{}] at frame draw #{}{}",
+        target, numAttachments, inst.mCurrentBoundDrawFbo, attStr, ir.drawCountBefore,
+        ir.invalidatedDepth ? " (DEPTH BUFFER INVALIDATED!)" : "");
+}
+
+void GlTrace::detourInvalidateSubFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments, GLint x, GLint y, GLsizei width, GLsizei height) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigInvalidateSubFramebuffer != nullptr) inst.mOrigInvalidateSubFramebuffer(target, numAttachments, attachments, x, y, width, height);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+
+    InvalidateRecord ir;
+    ir.callIndex = static_cast<uint32_t>(inst.mInvalidateRecords.size() + 1);
+    ir.functionName = "glInvalidateSubFramebuffer";
+    ir.fboId = inst.mCurrentBoundDrawFbo;
+    ir.drawCountBefore = static_cast<uint32_t>(inst.mPermanentFrameDraws.load(std::memory_order_relaxed));
+    ir.invalidatedDepth = false;
+
+    std::string attStr;
+    if (attachments != nullptr) {
+        for (GLsizei i = 0; i < numAttachments; ++i) {
+            std::string name = attachmentToString(attachments[i]);
+            ir.attachments.push_back(name);
+            if (!attStr.empty()) attStr += ", ";
+            attStr += name;
+            if (attachments[i] == GL_DEPTH_ATTACHMENT || attachments[i] == 0x821A || attachments[i] == 0x84F9) {
+                ir.invalidatedDepth = true;
+                if (inst.mCurrentBoundDrawFbo == 0) {
+                    inst.mFbo0DepthInvalidated = true;
+                }
+            }
+        }
+    }
+    inst.mInvalidateRecords.push_back(ir);
+
+    LodPocMod::logAll(LogLevel::Info,
+        "[GLTrace: Invalidate] glInvalidateSubFramebuffer(rect=[{},{},{}x{}], count={}) on FBO {} with attachments: [{}] at frame draw #{}",
+        x, y, width, height, numAttachments, inst.mCurrentBoundDrawFbo, attStr, ir.drawCountBefore);
+}
+
+void GlTrace::detourDiscardFramebufferEXT(GLenum target, GLsizei numAttachments, const GLenum *attachments) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDiscardFramebufferEXT != nullptr) inst.mOrigDiscardFramebufferEXT(target, numAttachments, attachments);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+
+    InvalidateRecord ir;
+    ir.callIndex = static_cast<uint32_t>(inst.mInvalidateRecords.size() + 1);
+    ir.functionName = "glDiscardFramebufferEXT";
+    ir.fboId = inst.mCurrentBoundDrawFbo;
+    ir.drawCountBefore = static_cast<uint32_t>(inst.mPermanentFrameDraws.load(std::memory_order_relaxed));
+    ir.invalidatedDepth = false;
+
+    std::string attStr;
+    if (attachments != nullptr) {
+        for (GLsizei i = 0; i < numAttachments; ++i) {
+            std::string name = attachmentToString(attachments[i]);
+            ir.attachments.push_back(name);
+            if (!attStr.empty()) attStr += ", ";
+            attStr += name;
+            if (attachments[i] == GL_DEPTH_ATTACHMENT || attachments[i] == 0x821A || attachments[i] == 0x84F9) {
+                ir.invalidatedDepth = true;
+                if (inst.mCurrentBoundDrawFbo == 0) {
+                    inst.mFbo0DepthInvalidated = true;
+                }
+            }
+        }
+    }
+    inst.mInvalidateRecords.push_back(ir);
+
+    LodPocMod::logAll(LogLevel::Info,
+        "[GLTrace: Invalidate] glDiscardFramebufferEXT on FBO {} with attachments: [{}] at frame draw #{}{}",
+        inst.mCurrentBoundDrawFbo, attStr, ir.drawCountBefore,
+        ir.invalidatedDepth ? " (DEPTH BUFFER DISCARDED!)" : "");
+}
+
+void GlTrace::detourUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigUniformMatrix4fv != nullptr) inst.mOrigUniformMatrix4fv(location, count, transpose, value);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+
+    uint32_t currentRunIdx = 1;
+    if (!inst.mCurrentFrameSegments.empty()) {
+        currentRunIdx = static_cast<uint32_t>(inst.mCurrentFrameSegments.back().drawRuns.size() + 1);
+    }
+
+    if (value != nullptr && count > 0) {
+        for (GLsizei i = 0; i < count; ++i) {
+            inst.checkMatrixCandidate(inst.mCurrentProgram, currentRunIdx, value + (i * 16), "glUniformMatrix4fv");
+        }
+    }
+
+    if (inst.mUniformLogCount < 300) {
+        inst.mUniformLogCount++;
+        std::string valStr = (value != nullptr && count > 0) ? formatFloats(value, count * 16, 16) : "null";
+        LodPocMod::logAll(LogLevel::Info,
+            "[GLTrace: Uniform] glUniformMatrix4fv(loc={}, count={}, trans={}) Prog={}: {}",
+            location, count, transpose ? "TRUE" : "FALSE", inst.mCurrentProgram, valStr);
+    }
+}
+
+void GlTrace::detourUniform4fv(GLint location, GLsizei count, const GLfloat *value) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigUniform4fv != nullptr) inst.mOrigUniform4fv(location, count, value);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+
+    if (inst.mUniformLogCount < 300) {
+        inst.mUniformLogCount++;
+        std::string valStr = (value != nullptr && count > 0) ? formatFloats(value, count * 4, 16) : "null";
+        LodPocMod::logAll(LogLevel::Info,
+            "[GLTrace: Uniform] glUniform4fv(loc={}, count={}) Prog={}: {}",
+            location, count, inst.mCurrentProgram, valStr);
+    }
+}
+
+void GlTrace::detourBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigBindBufferBase != nullptr) inst.mOrigBindBufferBase(target, index, buffer);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+
+    if (inst.mUniformLogCount < 300) {
+        inst.mUniformLogCount++;
+        LodPocMod::logAll(LogLevel::Info,
+            "[GLTrace: Buffer] glBindBufferBase(target=0x{:x}, index={}, buffer={}) Prog={}",
+            target, index, buffer, inst.mCurrentProgram);
+    }
+}
+
+void GlTrace::detourBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigBindBufferRange != nullptr) inst.mOrigBindBufferRange(target, index, buffer, offset, size);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+
+    if (inst.mUniformLogCount < 300) {
+        inst.mUniformLogCount++;
+        LodPocMod::logAll(LogLevel::Info,
+            "[GLTrace: Buffer] glBindBufferRange(target=0x{:x}, index={}, buffer={}, offset={}, size={}) Prog={}",
+            target, index, buffer, offset, size, inst.mCurrentProgram);
+    }
+}
+
+void GlTrace::detourBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigBufferSubData != nullptr) inst.mOrigBufferSubData(target, offset, size, data);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+
+    uint32_t currentRunIdx = 1;
+    if (!inst.mCurrentFrameSegments.empty()) {
+        currentRunIdx = static_cast<uint32_t>(inst.mCurrentFrameSegments.back().drawRuns.size() + 1);
+    }
+
+    if (data != nullptr && size >= 64) {
+        const float *fData = reinterpret_cast<const float *>(data);
+        size_t floatCount = size / sizeof(float);
+        for (size_t i = 0; i + 16 <= floatCount && i < 64; i += 16) {
+            inst.checkMatrixCandidate(inst.mCurrentProgram, currentRunIdx, fData + i, "glBufferSubData");
+        }
+    }
+
+    if (size <= 1024 && inst.mUniformLogCount < 300) {
+        inst.mUniformLogCount++;
+        std::string valStr = "null";
+        if (data != nullptr) {
+            valStr = formatFloats(reinterpret_cast<const float *>(data), size / sizeof(float), 16);
+        }
+        LodPocMod::logAll(LogLevel::Info,
+            "[GLTrace: Buffer] glBufferSubData(target=0x{:x}, offset={}, size={}) Prog={}: {}",
+            target, offset, size, inst.mCurrentProgram, valStr);
+    }
+}
+
+void GlTrace::detourBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigBufferData != nullptr) inst.mOrigBufferData(target, size, data, usage);
+    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != inst.getRenderThreadId()) return;
+
+    uint32_t currentRunIdx = 1;
+    if (!inst.mCurrentFrameSegments.empty()) {
+        currentRunIdx = static_cast<uint32_t>(inst.mCurrentFrameSegments.back().drawRuns.size() + 1);
+    }
+
+    if (data != nullptr && size >= 64) {
+        const float *fData = reinterpret_cast<const float *>(data);
+        size_t floatCount = size / sizeof(float);
+        for (size_t i = 0; i + 16 <= floatCount && i < 64; i += 16) {
+            inst.checkMatrixCandidate(inst.mCurrentProgram, currentRunIdx, fData + i, "glBufferData");
+        }
+    }
+
+    if (size <= 1024 && inst.mUniformLogCount < 300) {
+        inst.mUniformLogCount++;
+        std::string valStr = "null";
+        if (data != nullptr) {
+            valStr = formatFloats(reinterpret_cast<const float *>(data), size / sizeof(float), 16);
+        }
+        LodPocMod::logAll(LogLevel::Info,
+            "[GLTrace: Buffer] glBufferData(target=0x{:x}, size={}, usage=0x{:x}) Prog={}: {}",
+            target, size, usage, inst.mCurrentProgram, valStr);
+    }
+}
+
+void *GlTrace::detourMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+    auto &inst = GlTrace::instance();
+    void *res = inst.mOrigMapBufferRange ? inst.mOrigMapBufferRange(target, offset, length, access) : nullptr;
+    if (inst.mState.load(std::memory_order_relaxed) == TraceState::Recording && gettid() == inst.getRenderThreadId()) {
+        if (inst.mUniformLogCount < 300) {
+            inst.mUniformLogCount++;
+            LodPocMod::logAll(LogLevel::Info,
+                "[GLTrace: Buffer] glMapBufferRange(target=0x{:x}, off={}, len={}, access=0x{:x}) -> {:p} Prog={}",
+                target, offset, length, access, res, inst.mCurrentProgram);
+        }
+    }
+    return res;
+}
+
+GLboolean GlTrace::detourUnmapBuffer(GLenum target) {
+    auto &inst = GlTrace::instance();
+    GLboolean res = inst.mOrigUnmapBuffer ? inst.mOrigUnmapBuffer(target) : GL_TRUE;
+    if (inst.mState.load(std::memory_order_relaxed) == TraceState::Recording && gettid() == inst.getRenderThreadId()) {
+        if (inst.mUniformLogCount < 300) {
+            inst.mUniformLogCount++;
+            LodPocMod::logAll(LogLevel::Info,
+                "[GLTrace: Buffer] glUnmapBuffer(target=0x{:x}) Prog={}", target, inst.mCurrentProgram);
+        }
+    }
+    return res;
+}
+
+void GlTrace::checkMatrixCandidate(GLuint prog, uint32_t drawRunIdx, const float *m, const char *source) {
+    if (m == nullptr) return;
+    GLsizei vpW = mCurrentVpW > 0 ? mCurrentVpW : 2392;
+    GLsizei vpH = mCurrentVpH > 0 ? mCurrentVpH : 1080;
+    const float aspect = static_cast<float>(vpW) / static_cast<float>(vpH);
+
+    // 1. Perspective Projection Check
+    auto testPerspective = [&](float m00, float m11, float mZSign, bool transposed) -> bool {
+        if (m11 < 0.2f || m11 > 10.0f) return false;
+        if (std::abs(mZSign - (-1.0f)) > 0.15f && std::abs(mZSign - 1.0f) > 0.15f) return false;
+
+        float expectedM00 = m11 / aspect;
+        if (std::abs(m00 - expectedM00) > 0.15f * expectedM00) return false;
+
+        float fovRad = 2.0f * std::atan(1.0f / m11);
+        float fovDeg = fovRad * (180.0f / 3.141592653589793f);
+        if (fovDeg < 25.0f || fovDeg > 125.0f) return false;
+
+        MatrixCandidate mc;
+        mc.program = prog;
+        mc.drawRunIndexBefore = drawRunIdx;
+        mc.type = transposed ? "PROJECTION (Transposed/Row-Major)" : "PROJECTION (Col-Major)";
+        mc.fovDeg = fovDeg;
+        mc.aspect = aspect;
+        std::copy(m, m + 16, mc.values);
+        mMatrixCandidates.push_back(mc);
+
+        LodPocMod::logAll(LogLevel::Info,
+            "[MatrixFinder] >>> PERSPECTIVE PROJECTION MATRIX DETECTED ({}) <<<", mc.type);
+        LodPocMod::logAll(LogLevel::Info,
+            "[MatrixFinder]   Prog: {} | Before Draw Run #{:2d} | Source: {} | FOV: {:.1f} deg | Aspect: {:.3f}",
+            prog, drawRunIdx, source, fovDeg, aspect);
+        LodPocMod::logAll(LogLevel::Info,
+            "[MatrixFinder]   Row 0: [{:8.4f}, {:8.4f}, {:8.4f}, {:8.4f}]", m[0], m[1], m[2], m[3]);
+        LodPocMod::logAll(LogLevel::Info,
+            "[MatrixFinder]   Row 1: [{:8.4f}, {:8.4f}, {:8.4f}, {:8.4f}]", m[4], m[5], m[6], m[7]);
+        LodPocMod::logAll(LogLevel::Info,
+            "[MatrixFinder]   Row 2: [{:8.4f}, {:8.4f}, {:8.4f}, {:8.4f}]", m[8], m[9], m[10], m[11]);
+        LodPocMod::logAll(LogLevel::Info,
+            "[MatrixFinder]   Row 3: [{:8.4f}, {:8.4f}, {:8.4f}, {:8.4f}]", m[12], m[13], m[14], m[15]);
+        return true;
+    };
+
+    if (!testPerspective(m[0], m[5], m[11], false)) {
+        testPerspective(m[0], m[5], m[14], true);
+    }
+
+    // 2. View-Projection Check
+    float row3LenSq = m[3] * m[3] + m[7] * m[7] + m[11] * m[11];
+    float col3LenSq = m[12] * m[12] + m[13] * m[13] + m[14] * m[14];
+
+    if ((std::abs(row3LenSq - 1.0f) < 0.25f && (std::abs(m[3]) > 0.05f || std::abs(m[7]) > 0.05f || std::abs(m[11]) > 0.05f)) ||
+        (std::abs(col3LenSq - 1.0f) < 0.25f && (std::abs(m[12]) > 0.05f || std::abs(m[13]) > 0.05f || std::abs(m[14]) > 0.05f))) {
+        bool alreadyLogged = false;
+        for (const auto &c : mMatrixCandidates) {
+            if (c.program == prog && c.drawRunIndexBefore == drawRunIdx && std::memcmp(c.values, m, 16 * sizeof(float)) == 0) {
+                alreadyLogged = true;
+                break;
+            }
+        }
+        if (!alreadyLogged && mMatrixCandidates.size() < 50) {
+            MatrixCandidate mc;
+            mc.program = prog;
+            mc.drawRunIndexBefore = drawRunIdx;
+            mc.type = "VIEW-PROJECTION";
+            mc.fovDeg = 0.0f;
+            mc.aspect = aspect;
+            std::copy(m, m + 16, mc.values);
+            mMatrixCandidates.push_back(mc);
+
+            LodPocMod::logAll(LogLevel::Info,
+                "[MatrixFinder] >>> VIEW-PROJECTION MATRIX DETECTED <<<");
+            LodPocMod::logAll(LogLevel::Info,
+                "[MatrixFinder]   Prog: {} | Before Draw Run #{:2d} | Source: {}",
+                prog, drawRunIdx, source);
+            LodPocMod::logAll(LogLevel::Info,
+                "[MatrixFinder]   Row 0: [{:8.4f}, {:8.4f}, {:8.4f}, {:8.4f}]", m[0], m[1], m[2], m[3]);
+            LodPocMod::logAll(LogLevel::Info,
+                "[MatrixFinder]   Row 1: [{:8.4f}, {:8.4f}, {:8.4f}, {:8.4f}]", m[4], m[5], m[6], m[7]);
+            LodPocMod::logAll(LogLevel::Info,
+                "[MatrixFinder]   Row 2: [{:8.4f}, {:8.4f}, {:8.4f}, {:8.4f}]", m[8], m[9], m[10], m[11]);
+            LodPocMod::logAll(LogLevel::Info,
+                "[MatrixFinder]   Row 3: [{:8.4f}, {:8.4f}, {:8.4f}, {:8.4f}]", m[12], m[13], m[14], m[15]);
+        }
+    }
+}
 // -----------------------------------------------------------------------------
 
 void GlTrace::install() {
@@ -859,6 +1515,26 @@ void GlTrace::installHeavyHooks() {
     hookFn("glDepthMask", {}, reinterpret_cast<void *>(&detourDepthMask), reinterpret_cast<void **>(&mOrigDepthMask));
     hookFn("glUseProgram", {}, reinterpret_cast<void *>(&detourUseProgram), reinterpret_cast<void **>(&mOrigUseProgram));
 
+    // Stage 1: Depth, Blend, Cull, Clear, Invalidate, Uniforms & Buffers
+    hookFn("glDepthFunc", {}, reinterpret_cast<void *>(&detourDepthFunc), reinterpret_cast<void **>(&mOrigDepthFunc));
+    hookFn("glDepthRangef", {}, reinterpret_cast<void *>(&detourDepthRangef), reinterpret_cast<void **>(&mOrigDepthRangef));
+    hookFn("glBlendFunc", {}, reinterpret_cast<void *>(&detourBlendFunc), reinterpret_cast<void **>(&mOrigBlendFunc));
+    hookFn("glBlendFuncSeparate", {}, reinterpret_cast<void *>(&detourBlendFuncSeparate), reinterpret_cast<void **>(&mOrigBlendFuncSeparate));
+    hookFn("glCullFace", {}, reinterpret_cast<void *>(&detourCullFace), reinterpret_cast<void **>(&mOrigCullFace));
+    hookFn("glClearDepthf", {"glClearDepth"}, reinterpret_cast<void *>(&detourClearDepthf), reinterpret_cast<void **>(&mOrigClearDepthf));
+    hookFn("glClear", {}, reinterpret_cast<void *>(&detourClear), reinterpret_cast<void **>(&mOrigClear));
+    hookFn("glInvalidateFramebuffer", {}, reinterpret_cast<void *>(&detourInvalidateFramebuffer), reinterpret_cast<void **>(&mOrigInvalidateFramebuffer));
+    hookFn("glInvalidateSubFramebuffer", {}, reinterpret_cast<void *>(&detourInvalidateSubFramebuffer), reinterpret_cast<void **>(&mOrigInvalidateSubFramebuffer));
+    hookFn("glDiscardFramebufferEXT", {"glDiscardFramebufferOES"}, reinterpret_cast<void *>(&detourDiscardFramebufferEXT), reinterpret_cast<void **>(&mOrigDiscardFramebufferEXT));
+    hookFn("glUniformMatrix4fv", {}, reinterpret_cast<void *>(&detourUniformMatrix4fv), reinterpret_cast<void **>(&mOrigUniformMatrix4fv));
+    hookFn("glUniform4fv", {}, reinterpret_cast<void *>(&detourUniform4fv), reinterpret_cast<void **>(&mOrigUniform4fv));
+    hookFn("glBindBufferBase", {}, reinterpret_cast<void *>(&detourBindBufferBase), reinterpret_cast<void **>(&mOrigBindBufferBase));
+    hookFn("glBindBufferRange", {}, reinterpret_cast<void *>(&detourBindBufferRange), reinterpret_cast<void **>(&mOrigBindBufferRange));
+    hookFn("glBufferSubData", {}, reinterpret_cast<void *>(&detourBufferSubData), reinterpret_cast<void **>(&mOrigBufferSubData));
+    hookFn("glBufferData", {}, reinterpret_cast<void *>(&detourBufferData), reinterpret_cast<void **>(&mOrigBufferData));
+    hookFn("glMapBufferRange", {"glMapBufferRangeEXT"}, reinterpret_cast<void *>(&detourMapBufferRange), reinterpret_cast<void **>(&mOrigMapBufferRange));
+    hookFn("glUnmapBuffer", {"glUnmapBufferOES", "glUnmapBufferEXT"}, reinterpret_cast<void *>(&detourUnmapBuffer), reinterpret_cast<void **>(&mOrigUnmapBuffer));
+
     mHeavyHooksInstalled = true;
     LodPocMod::logAll(LogLevel::Info, "[GLTrace] Installed {} heavy GL trace hooks", mHeavyHooks.size());
 }
@@ -883,6 +1559,25 @@ void GlTrace::removeHeavyHooks() {
     mOrigDisable = nullptr;
     mOrigDepthMask = nullptr;
     mOrigUseProgram = nullptr;
+
+    mOrigDepthFunc = nullptr;
+    mOrigDepthRangef = nullptr;
+    mOrigBlendFunc = nullptr;
+    mOrigBlendFuncSeparate = nullptr;
+    mOrigCullFace = nullptr;
+    mOrigClearDepthf = nullptr;
+    mOrigClear = nullptr;
+    mOrigInvalidateFramebuffer = nullptr;
+    mOrigInvalidateSubFramebuffer = nullptr;
+    mOrigDiscardFramebufferEXT = nullptr;
+    mOrigUniformMatrix4fv = nullptr;
+    mOrigUniform4fv = nullptr;
+    mOrigBindBufferBase = nullptr;
+    mOrigBindBufferRange = nullptr;
+    mOrigBufferSubData = nullptr;
+    mOrigBufferData = nullptr;
+    mOrigMapBufferRange = nullptr;
+    mOrigUnmapBuffer = nullptr;
 
     mOrigDrawArrays = nullptr;
     mOrigDrawRangeElements = nullptr;
