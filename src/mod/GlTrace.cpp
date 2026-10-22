@@ -214,8 +214,8 @@ void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
         return;
     }
 
-    // Check consecutive heavy frames for world detection (>500 draws)
-    if (frameDraws > 500) {
+    // Check consecutive heavy frames for world detection (>50 draws)
+    if (frameDraws > 50) {
         mConsecutiveHeavyFrames++;
     } else {
         mConsecutiveHeavyFrames = 0;
@@ -225,7 +225,7 @@ void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
         mWorldDetected = true;
         mWorldDetectedTime = now;
         LodPocMod::logAll(LogLevel::Info,
-                          "[GLTrace] world detected (60 consecutive frames with >500 draws, frame #{} had {} draws). Arming in-world trace in ~{}s.",
+                          "[GLTrace] world detected (60 consecutive frames with >50 draws, frame #{} had {} draws). Arming in-world trace in ~{}s.",
                           frameCount, frameDraws, mConfigTraceDelayAfterWorldSec);
     }
 

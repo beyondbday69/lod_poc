@@ -395,8 +395,8 @@ void PocQuad::onBindFramebufferBefore(GLuint newFbo, GLuint currentBoundFbo, uin
     if (trigger != "before_fbo1") return;
 
     // Trigger condition:
-    // Bound FBO is 0, new FBO is non-zero, frame draws > 500 (world pass complete)
-    if (currentBoundFbo == 0 && newFbo != 0 && frameDraws > 500) {
+    // Bound FBO is 0, new FBO is non-zero, frame draws >= 30 (world pass complete across all render distances)
+    if (currentBoundFbo == 0 && newFbo != 0 && frameDraws >= 30) {
         drawQuad(0, terrainDepthFunc, depthInvalidated);
         mDrawnThisFrame.store(true, std::memory_order_relaxed);
     }
