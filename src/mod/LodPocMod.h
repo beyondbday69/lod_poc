@@ -10,13 +10,21 @@
 #include <string_view>
 
 #include "mod/Config.h"
+#include "mod/FileLog.h"
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <fmt/format.h>
 #include <pl/Mod.hpp>
 #include <pl/memory/Hook.hpp>
 
 namespace lod_poc {
+
+enum class LogLevel {
+    Info,
+    Warn,
+    Error
+};
 
 struct Vec3 {
     float x{0.0f};
@@ -42,6 +50,30 @@ class LodPocMod {
     bool enable();
     bool disable();
     bool unload();
+
+    template <typename... Args>
+    static void logAll(LogLevel level, fmt::format_string<Args...> fmtStr, Args &&...args) {
+        try {
+            std::string msg = fmt::format(fmtStr, std::forward<Args>(args)...);
+            char levelChar = 'I';
+            auto &logger = LodPocMod::instance().getSelf().getLogger();
+            switch (level) {
+                case LogLevel::Info:
+                    logger.info("{}", msg);
+                    levelChar = 'I';
+                    break;
+                case LogLevel::Warn:
+                    logger.warn("{}", msg);
+                    levelChar = 'W';
+                    break;
+                case LogLevel::Error:
+                    logger.error("{}", msg);
+                    levelChar = 'E';
+                    break;
+            }
+            FileLog::instance().write(levelChar, msg);
+        } catch (...) {}
+    }
 
   private:
     using ChunkLightingTaskFn = void (*)(void *a0, void *a1, void *a2, void *a3,

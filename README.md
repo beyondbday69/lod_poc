@@ -46,8 +46,31 @@ Packaged artifacts will be generated in:
 
 ## Reading Logs
 
-Monitor the diagnostic output via `adb logcat` (do not assume the log tag):
+The mod writes real-time logs to on-device files on every launch so logs can be inspected directly on the phone without needing ADB or a PC.
 
+### Log Locations on Phone
+
+1. **Download Directory (Easiest)**:
+   - Path: `/storage/emulated/0/Download/lod_poc.log`
+   - Accessible using any standard Android file manager (Files by Google, Solid Explorer, etc.) without root or special permissions.
+2. **Primary Mod Data Directory**:
+   - Path: `<LeviLaunchroid Mod Data Directory>/lod_poc.log` (resolved at runtime via `NativeMod::getDataDir()`).
+
+### Log Rotation & Crash Investigation
+
+- On every launch, the previous log is automatically renamed to **`lod_poc.log.old`** (and any older `.old` is replaced), then a fresh `lod_poc.log` is created.
+- Each line is flushed (`fflush`) immediately so all output survives unexpected game exits and crashes.
+- File sizes are safely capped at 5 MB per run.
+
+### What to Send for Debugging / Investigation
+
+If the game crashes or freezes:
+- Send **`lod_poc.log`** (current run).
+- If you reopened Minecraft after the crash, the crash log will now be in **`lod_poc.log.old`**; please send **both** `lod_poc.log` and `lod_poc.log.old`.
+
+### Real-Time ADB Logcat (Optional)
+
+If monitoring live from a PC:
 ```bash
 adb logcat | grep -iE "lod_poc|Probe"
 ```

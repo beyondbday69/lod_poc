@@ -111,6 +111,7 @@ find_library(LL_GLES_LIB GLESv2 REQUIRED)
 add_library(${MOD_LIBRARY_NAME} SHARED
     src/main.cpp
     src/mod/Config.cpp
+    src/mod/FileLog.cpp
     src/mod/LodPocMod.cpp)
 
 set_target_properties(${MOD_LIBRARY_NAME} PROPERTIES

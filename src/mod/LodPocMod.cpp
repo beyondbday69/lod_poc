@@ -2,10 +2,13 @@
 #include "signatures.h"
 
 #include <algorithm>
+#include <csignal>
 #include <cstring>
 #include <dlfcn.h>
+#include <link.h>
 #include <string>
 #include <sys/syscall.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 
 #include <pl/memory/Signature.hpp>
@@ -25,6 +28,232 @@ inline pid_t getThreadId() {
 #endif
 }
 
+// -----------------------------------------------------------------------------
+// Crash Capture (Async-Signal-Safe)
+// -----------------------------------------------------------------------------
+
+struct SavedSigactions {
+    struct sigaction segv{};
+    struct sigaction bus{};
+    struct sigaction abrt{};
+    struct sigaction ill{};
+    struct sigaction fpe{};
+    bool installed{false};
+};
+
+static SavedSigactions sSavedSigs;
+static std::atomic<uintptr_t> sMinecraftBase{0};
+static std::atomic<int> sPrimaryFd{-1};
+static std::atomic<int> sSecondaryFd{-1};
+
+static void writeRaw(int fd, const char *str) {
+    if (fd < 0 || str == nullptr) {
+        return;
+    }
+    size_t len = 0;
+    while (str[len] != '\0') {
+        ++len;
+    }
+    (void)::write(fd, str, len);
+}
+
+static void writeHex(int fd, uint64_t val) {
+    if (fd < 0) {
+        return;
+    }
+    char buf[19];
+    buf[0] = '0';
+    buf[1] = 'x';
+    for (int i = 15; i >= 0; --i) {
+        const uint8_t nibble = val & 0xF;
+        buf[2 + i] = (nibble < 10) ? ('0' + nibble) : ('a' + (nibble - 10));
+        val >>= 4;
+    }
+    buf[18] = '\0';
+    (void)::write(fd, buf, 18);
+}
+
+static void writeDec(int fd, int val) {
+    if (fd < 0) {
+        return;
+    }
+    if (val < 0) {
+        (void)::write(fd, "-", 1);
+        val = -val;
+    }
+    char buf[12];
+    int idx = 0;
+    if (val == 0) {
+        buf[idx++] = '0';
+    } else {
+        char temp[12];
+        int tlen = 0;
+        while (val > 0) {
+            temp[tlen++] = '0' + (val % 10);
+            val /= 10;
+        }
+        for (int i = tlen - 1; i >= 0; --i) {
+            buf[idx++] = temp[i];
+        }
+    }
+    (void)::write(fd, buf, static_cast<size_t>(idx));
+}
+
+static struct sigaction *getOldSigaction(int sig) {
+    switch (sig) {
+        case SIGSEGV: return &sSavedSigs.segv;
+        case SIGBUS:  return &sSavedSigs.bus;
+        case SIGABRT: return &sSavedSigs.abrt;
+        case SIGILL:  return &sSavedSigs.ill;
+        case SIGFPE:  return &sSavedSigs.fpe;
+        default:      return nullptr;
+    }
+}
+
+static void crashSignalHandler(int sig, siginfo_t *info, void *context) {
+    const auto *uc = static_cast<const ucontext_t *>(context);
+    uint64_t pc = 0, lr = 0, sp = 0;
+    void *faultAddr = (info != nullptr) ? info->si_addr : nullptr;
+
+#if defined(__aarch64__)
+    if (uc != nullptr) {
+        pc = uc->uc_mcontext.pc;
+        lr = uc->uc_mcontext.regs[30];
+        sp = uc->uc_mcontext.sp;
+    }
+#endif
+
+    const uint64_t mcBase = sMinecraftBase.load(std::memory_order_relaxed);
+    const int fds[2] = {sPrimaryFd.load(std::memory_order_relaxed),
+                        sSecondaryFd.load(std::memory_order_relaxed)};
+
+    for (int fd : fds) {
+        if (fd < 0) {
+            continue;
+        }
+        writeRaw(fd, "\n================================================================\n");
+        writeRaw(fd, "FATAL CRASH CAUGHT BY LOD_POC:\n");
+        writeRaw(fd, "  Signal:     ");
+        writeDec(fd, sig);
+        writeRaw(fd, " (");
+        if (sig == SIGSEGV) writeRaw(fd, "SIGSEGV");
+        else if (sig == SIGBUS) writeRaw(fd, "SIGBUS");
+        else if (sig == SIGABRT) writeRaw(fd, "SIGABRT");
+        else if (sig == SIGILL) writeRaw(fd, "SIGILL");
+        else if (sig == SIGFPE) writeRaw(fd, "SIGFPE");
+        else writeRaw(fd, "UNKNOWN");
+        writeRaw(fd, ")\n  Fault Addr: ");
+        writeHex(fd, reinterpret_cast<uintptr_t>(faultAddr));
+        writeRaw(fd, "\n  PC:         ");
+        writeHex(fd, pc);
+        writeRaw(fd, "\n  LR:         ");
+        writeHex(fd, lr);
+        writeRaw(fd, "\n  SP:         ");
+        writeHex(fd, sp);
+        writeRaw(fd, "\n  MC Base:    ");
+        writeHex(fd, mcBase);
+        if (mcBase != 0) {
+            writeRaw(fd, "\n  PC - Base:  ");
+            writeHex(fd, pc - mcBase);
+            writeRaw(fd, "\n  LR - Base:  ");
+            writeHex(fd, lr - mcBase);
+        }
+        writeRaw(fd, "\n================================================================\n");
+        (void)::fsync(fd);
+    }
+
+    // Chain to previously installed signal handler
+    struct sigaction *oldSa = getOldSigaction(sig);
+    if (oldSa != nullptr) {
+        if (oldSa->sa_flags & SA_SIGINFO) {
+            if (oldSa->sa_sigaction != nullptr) {
+                oldSa->sa_sigaction(sig, info, context);
+                return;
+            }
+        } else {
+            if (oldSa->sa_handler != SIG_DFL && oldSa->sa_handler != SIG_IGN &&
+                oldSa->sa_handler != nullptr) {
+                oldSa->sa_handler(sig);
+                return;
+            }
+        }
+    }
+
+    // Fallback to default disposition
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void installCrashHandlers() {
+    if (sSavedSigs.installed) {
+        return;
+    }
+    sPrimaryFd.store(FileLog::instance().getPrimaryFd(), std::memory_order_relaxed);
+    sSecondaryFd.store(FileLog::instance().getSecondaryFd(), std::memory_order_relaxed);
+
+    struct sigaction sa{};
+    sa.sa_sigaction = crashSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGSEGV, &sa, &sSavedSigs.segv);
+    sigaction(SIGBUS, &sa, &sSavedSigs.bus);
+    sigaction(SIGABRT, &sa, &sSavedSigs.abrt);
+    sigaction(SIGILL, &sa, &sSavedSigs.ill);
+    sigaction(SIGFPE, &sa, &sSavedSigs.fpe);
+    sSavedSigs.installed = true;
+}
+
+static void restoreCrashHandlers() {
+    if (!sSavedSigs.installed) {
+        return;
+    }
+    sigaction(SIGSEGV, &sSavedSigs.segv, nullptr);
+    sigaction(SIGBUS, &sSavedSigs.bus, nullptr);
+    sigaction(SIGABRT, &sSavedSigs.abrt, nullptr);
+    sigaction(SIGILL, &sSavedSigs.ill, nullptr);
+    sigaction(SIGFPE, &sSavedSigs.fpe, nullptr);
+    sSavedSigs.installed = false;
+}
+
+// -----------------------------------------------------------------------------
+// Module Base Resolver
+// -----------------------------------------------------------------------------
+
+static uintptr_t getModuleBase(const char *moduleName) {
+    struct Match {
+        const char *name;
+        uintptr_t base;
+    } match{moduleName, 0};
+
+    dl_iterate_phdr([](struct dl_phdr_info *info, size_t, void *data) -> int {
+        auto *m = static_cast<Match *>(data);
+        if (info->dlpi_name != nullptr && std::strstr(info->dlpi_name, m->name) != nullptr) {
+            m->base = info->dlpi_addr;
+            return 1;
+        }
+        return 0;
+    }, &match);
+
+    if (match.base == 0) {
+        FILE *fp = std::fopen("/proc/self/maps", "r");
+        if (fp != nullptr) {
+            char line[512];
+            while (std::fgets(line, sizeof(line), fp) != nullptr) {
+                if (std::strstr(line, moduleName) != nullptr) {
+                    uintptr_t start = 0;
+                    if (std::sscanf(line, "%lx-", &start) == 1) {
+                        match.base = start;
+                        break;
+                    }
+                }
+            }
+            std::fclose(fp);
+        }
+    }
+    return match.base;
+}
+
 } // namespace
 
 LodPocMod &LodPocMod::instance() {
@@ -41,74 +270,106 @@ LodPocMod::LodPocMod()
 bool LodPocMod::load() {
     auto &self = getSelf();
     try {
-        self.getLogger().info("Loading LOD PoC mod (mcpe 1.26.51.1)...");
+        // Initialize file logger in mod data directory
+        FileLog::instance().open(self.getDataDir());
+
+        logAll(LogLevel::Info, "Loading LOD PoC mod v{} (author: {})...",
+               self.getVersion(), self.getAuthor());
+        logAll(LogLevel::Info, "Target Minecraft Bedrock: 1.26.51.1 (arm64-v8a)");
+
+        if (FileLog::instance().isPrimaryOpen()) {
+            logAll(LogLevel::Info, "Primary log file opened: {}",
+                   FileLog::instance().getPrimaryPath());
+        } else {
+            logAll(LogLevel::Warn, "Primary log file failed to open at: {}",
+                   FileLog::instance().getPrimaryPath());
+        }
+
+        if (FileLog::instance().isSecondaryOpen()) {
+            logAll(LogLevel::Info, "Secondary log file opened: {}",
+                   FileLog::instance().getSecondaryPath());
+        } else {
+            logAll(LogLevel::Info, "Secondary log file not available at: {}",
+                   FileLog::instance().getSecondaryPath());
+        }
+
         std::lock_guard lock(mConfigMutex);
         mConfigFile.emplace(ModConfig{}, self.getConfigDir() / "config.json",
                             self.getConfigDir() / "config.schema.json");
         if (!mConfigFile->load()) {
-            self.getLogger().warn("Failed to read config.json, using defaults");
+            logAll(LogLevel::Warn, "Failed to read config.json, using defaults");
         }
-        self.getLogger().info("Loaded successfully");
+        logAll(LogLevel::Info, "Loaded successfully");
         return true;
     } catch (const std::exception &ex) {
-        self.getLogger().error("load() threw exception: {}", ex.what());
+        logAll(LogLevel::Error, "load() threw exception: {}", ex.what());
     } catch (...) {
-        self.getLogger().error("load() threw unknown exception");
+        logAll(LogLevel::Error, "load() threw unknown exception");
     }
     return false;
 }
 
 bool LodPocMod::enable() {
-    auto &self = getSelf();
     try {
-        self.getLogger().info("Enabling LOD PoC diagnostic probes...");
+        logAll(LogLevel::Info, "Enabling LOD PoC diagnostic probes...");
+
+        // Resolve and log libminecraftpe.so base address
+        const uintptr_t mcBase = getModuleBase(kMinecraftLibrary);
+        sMinecraftBase.store(mcBase, std::memory_order_relaxed);
+        logAll(LogLevel::Info, "{} base address: 0x{:016x}", kMinecraftLibrary, mcBase);
+
+        // Install crash capture handlers
+        installCrashHandlers();
+
+        // Install probe hooks
         installProbes();
-        self.getLogger().info("LOD PoC mod enabled");
+
+        logAll(LogLevel::Info, "LOD PoC mod enabled");
         return true;
     } catch (const std::exception &ex) {
-        self.getLogger().error("enable() threw exception: {}", ex.what());
+        logAll(LogLevel::Error, "enable() threw exception: {}", ex.what());
     } catch (...) {
-        self.getLogger().error("enable() threw unknown exception");
+        logAll(LogLevel::Error, "enable() threw unknown exception");
     }
     return false;
 }
 
 bool LodPocMod::disable() {
-    auto &self = getSelf();
     try {
-        self.getLogger().info("Disabling LOD PoC diagnostic probes...");
+        logAll(LogLevel::Info, "Disabling LOD PoC diagnostic probes...");
         removeProbes();
-        self.getLogger().info("LOD PoC mod disabled");
+        restoreCrashHandlers();
+        logAll(LogLevel::Info, "LOD PoC mod disabled");
         return true;
     } catch (const std::exception &ex) {
-        self.getLogger().error("disable() threw exception: {}", ex.what());
+        logAll(LogLevel::Error, "disable() threw exception: {}", ex.what());
     } catch (...) {
-        self.getLogger().error("disable() threw unknown exception");
+        logAll(LogLevel::Error, "disable() threw unknown exception");
     }
     return false;
 }
 
 bool LodPocMod::unload() {
-    auto &self = getSelf();
     try {
-        self.getLogger().info("Unloading LOD PoC mod...");
+        logAll(LogLevel::Info, "Unloading LOD PoC mod...");
         removeProbes();
+        restoreCrashHandlers();
         {
             std::lock_guard lock(mConfigMutex);
             mConfigFile.reset();
         }
-        self.getLogger().info("Unloaded successfully");
+        logAll(LogLevel::Info, "Unloaded successfully");
+        FileLog::instance().close();
         return true;
     } catch (const std::exception &ex) {
-        self.getLogger().error("unload() threw exception: {}", ex.what());
+        logAll(LogLevel::Error, "unload() threw exception: {}", ex.what());
     } catch (...) {
-        self.getLogger().error("unload() threw unknown exception");
+        logAll(LogLevel::Error, "unload() threw unknown exception");
     }
     return false;
 }
 
 void LodPocMod::installProbes() {
-    auto &self = getSelf();
     removeProbes();
 
     const auto now = std::chrono::steady_clock::now();
@@ -122,7 +383,7 @@ void LodPocMod::installProbes() {
     const auto lightingAddr = pl::memory::resolveSignature(
         mc_signatures::kSigChunkLightingTask, kMinecraftLibrary);
     if (lightingAddr == 0) {
-        self.getLogger().warn("[Probe 1] ChunkSource::_lightingTask signature NOT FOUND; disabling probe 1");
+        logAll(LogLevel::Warn, "[Probe 1: lightingTask] NOT FOUND (sig failed)");
     } else {
         void *orig = nullptr;
         pl::memory::HookHandle handle(
@@ -130,30 +391,27 @@ void LodPocMod::installProbes() {
             reinterpret_cast<void *>(&LodPocMod::lightingTaskDetour),
             &orig);
         if (!handle.installed()) {
-            self.getLogger().error("[Probe 1] Failed to hook ChunkSource::_lightingTask at 0x{:x}", lightingAddr);
+            logAll(LogLevel::Error, "[Probe 1: lightingTask] FAILED at 0x{:x}", lightingAddr);
         } else {
             mOriginalLightingTask = reinterpret_cast<ChunkLightingTaskFn>(orig);
             mLightingHook = std::move(handle);
-            self.getLogger().info("[Probe 1] Hooked ChunkSource::_lightingTask at 0x{:x}", lightingAddr);
+            logAll(LogLevel::Info, "[Probe 1: lightingTask] Hooked at 0x{:x}", lightingAddr);
         }
     }
 
     // -------------------------------------------------------------------------
     // Probe 2: glBindFramebuffer
-    // Note: The preloader SDK does not provide a GOT/PLT hook API; inline hooks
-    // via pl::memory::HookHandle on the dlsym'd GLES symbol cleanly intercept
-    // all calls process-wide including libminecraftpe.so.
     // -------------------------------------------------------------------------
     void *bindFbTarget = nullptr;
     void *glesLib = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
-    if (glesLib) {
+    if (glesLib != nullptr) {
         bindFbTarget = dlsym(glesLib, "glBindFramebuffer");
     }
-    if (!bindFbTarget) {
+    if (bindFbTarget == nullptr) {
         bindFbTarget = dlsym(RTLD_DEFAULT, "glBindFramebuffer");
     }
-    if (!bindFbTarget) {
-        self.getLogger().warn("[Probe 2] glBindFramebuffer symbol NOT FOUND via dlsym; disabling probe 2");
+    if (bindFbTarget == nullptr) {
+        logAll(LogLevel::Warn, "[Probe 2: glBindFramebuffer] NOT FOUND");
     } else {
         void *orig = nullptr;
         pl::memory::HookHandle handle(
@@ -161,11 +419,11 @@ void LodPocMod::installProbes() {
             reinterpret_cast<void *>(&LodPocMod::bindFramebufferDetour),
             &orig);
         if (!handle.installed()) {
-            self.getLogger().error("[Probe 2] Failed to hook glBindFramebuffer at {:p}", bindFbTarget);
+            logAll(LogLevel::Error, "[Probe 2: glBindFramebuffer] FAILED at {:p}", bindFbTarget);
         } else {
             mOriginalBindFramebuffer = reinterpret_cast<BindFramebufferFn>(orig);
             mBindFramebufferHook = std::move(handle);
-            self.getLogger().info("[Probe 2] Hooked glBindFramebuffer at {:p}", bindFbTarget);
+            logAll(LogLevel::Info, "[Probe 2: glBindFramebuffer] Hooked at {:p}", bindFbTarget);
         }
     }
 
@@ -174,14 +432,14 @@ void LodPocMod::installProbes() {
     // -------------------------------------------------------------------------
     void *swapTarget = nullptr;
     void *eglLib = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
-    if (eglLib) {
+    if (eglLib != nullptr) {
         swapTarget = dlsym(eglLib, "eglSwapBuffers");
     }
-    if (!swapTarget) {
+    if (swapTarget == nullptr) {
         swapTarget = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
     }
-    if (!swapTarget) {
-        self.getLogger().warn("[Probe 3] eglSwapBuffers symbol NOT FOUND via dlsym; disabling probe 3");
+    if (swapTarget == nullptr) {
+        logAll(LogLevel::Warn, "[Probe 3: eglSwapBuffers] NOT FOUND");
     } else {
         void *orig = nullptr;
         pl::memory::HookHandle handle(
@@ -189,11 +447,11 @@ void LodPocMod::installProbes() {
             reinterpret_cast<void *>(&LodPocMod::swapBuffersDetour),
             &orig);
         if (!handle.installed()) {
-            self.getLogger().error("[Probe 3] Failed to hook eglSwapBuffers at {:p}", swapTarget);
+            logAll(LogLevel::Error, "[Probe 3: eglSwapBuffers] FAILED at {:p}", swapTarget);
         } else {
             mOriginalSwapBuffers = reinterpret_cast<EglSwapBuffersFn>(orig);
             mSwapBuffersHook = std::move(handle);
-            self.getLogger().info("[Probe 3] Hooked eglSwapBuffers at {:p}", swapTarget);
+            logAll(LogLevel::Info, "[Probe 3: eglSwapBuffers] Hooked at {:p}", swapTarget);
         }
     }
 
@@ -203,10 +461,10 @@ void LodPocMod::installProbes() {
     const auto subChunkAddr = pl::memory::resolveSignature(
         mc_signatures::kSigSubChunkGetBlockStorage, kMinecraftLibrary);
     if (subChunkAddr != 0) {
-        self.getLogger().info("[Probe 4] SubChunk::getBlock signature resolved at 0x{:x}", subChunkAddr);
-        self.getLogger().info("[Probe 4] Verified Bedrock index formula: (x << 8) | (z << 4) | y (y stride 1, z stride 16, x stride 256)");
+        logAll(LogLevel::Info, "[Probe 4: SubChunk::getBlock] Resolved at 0x{:x} (verified formula: (x << 8) | (z << 4) | y)",
+               subChunkAddr);
     } else {
-        self.getLogger().warn("[Probe 4] SubChunk::getBlock signature failed to resolve in {}", kMinecraftLibrary);
+        logAll(LogLevel::Warn, "[Probe 4: SubChunk::getBlock] NOT FOUND (sig failed)");
     }
 
     // -------------------------------------------------------------------------
@@ -215,7 +473,7 @@ void LodPocMod::installProbes() {
     const auto cullAddr = pl::memory::resolveSignature(
         mc_signatures::kSigLevelRendererCameraCull, kMinecraftLibrary);
     if (cullAddr == 0) {
-        self.getLogger().warn("[Probe 5] LevelRendererCamera::cullPointOrChunk signature NOT FOUND; disabling probe 5");
+        logAll(LogLevel::Warn, "[Probe 5: cullPointOrChunk] NOT FOUND (sig failed)");
     } else {
         void *orig = nullptr;
         pl::memory::HookHandle handle(
@@ -223,11 +481,11 @@ void LodPocMod::installProbes() {
             reinterpret_cast<void *>(&LodPocMod::cullPointOrChunkDetour),
             &orig);
         if (!handle.installed()) {
-            self.getLogger().error("[Probe 5] Failed to hook LevelRendererCamera::cullPointOrChunk at 0x{:x}", cullAddr);
+            logAll(LogLevel::Error, "[Probe 5: cullPointOrChunk] FAILED at 0x{:x}", cullAddr);
         } else {
             mOriginalCull = reinterpret_cast<CullPointOrChunkFn>(orig);
             mCullHook = std::move(handle);
-            self.getLogger().info("[Probe 5] Hooked LevelRendererCamera::cullPointOrChunk at 0x{:x}", cullAddr);
+            logAll(LogLevel::Info, "[Probe 5: cullPointOrChunk] Hooked at 0x{:x}", cullAddr);
         }
     }
 }
@@ -249,7 +507,6 @@ void LodPocMod::removeProbes() {
 void LodPocMod::lightingTaskDetour(void *a0, void *a1, void *a2, void *a3,
                                    void *a4, void *a5, void *a6, void *a7) {
     auto &mod = LodPocMod::instance();
-    auto &self = mod.getSelf();
 
     // Read the 4 qwords from context (a0) BEFORE calling original
     uint64_t q[4] = {0, 0, 0, 0};
@@ -257,9 +514,9 @@ void LodPocMod::lightingTaskDetour(void *a0, void *a1, void *a2, void *a3,
         std::memcpy(q, a0, sizeof(q));
     }
 
-    // Call original forwarding all 8 args
+    // Call original forwarding all 8 args (never skip if non-null)
     const auto orig = mod.mOriginalLightingTask;
-    if (orig) {
+    if (orig != nullptr) {
         orig(a0, a1, a2, a3, a4, a5, a6, a7);
     }
 
@@ -267,9 +524,9 @@ void LodPocMod::lightingTaskDetour(void *a0, void *a1, void *a2, void *a3,
     const pid_t tid = getThreadId();
 
     if (call <= 20) {
-        self.getLogger().info(
-            "[Probe 1: lightingTask] #{} tid={} ctx={:p} [0x{:016x}, 0x{:016x}, 0x{:016x}, 0x{:016x}]",
-            call, tid, a0, q[0], q[1], q[2], q[3]);
+        logAll(LogLevel::Info,
+               "[Probe 1: lightingTask] #{} tid={} ctx={:p} [0x{:016x}, 0x{:016x}, 0x{:016x}, 0x{:016x}]",
+               call, tid, a0, q[0], q[1], q[2], q[3]);
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -281,20 +538,19 @@ void LodPocMod::lightingTaskDetour(void *a0, void *a1, void *a2, void *a3,
             mod.mLastLightingCalls.store(call, std::memory_order_relaxed);
             mod.mLastLightingReport = now;
             const double rate = (sec > 0.0) ? (static_cast<double>(call - prev) / sec) : 0.0;
-            self.getLogger().info(
-                "[Probe 1: lightingTask] 5s Summary: calls={}, rate={:.1f}/s, tid={}",
-                call, rate, tid);
+            logAll(LogLevel::Info,
+                   "[Probe 1: lightingTask] 5s Summary: calls={}, rate={:.1f}/s, tid={}",
+                   call, rate, tid);
         }
     }
 }
 
 void LodPocMod::bindFramebufferDetour(GLenum target, GLuint framebuffer) {
     auto &mod = LodPocMod::instance();
-    auto &self = mod.getSelf();
 
-    // Call original first
+    // Call original first (never skip if non-null)
     const auto orig = mod.mOriginalBindFramebuffer;
-    if (orig) {
+    if (orig != nullptr) {
         orig(target, framebuffer);
     }
 
@@ -302,9 +558,9 @@ void LodPocMod::bindFramebufferDetour(GLenum target, GLuint framebuffer) {
     const pid_t tid = getThreadId();
 
     if (call <= 20) {
-        self.getLogger().info(
-            "[Probe 2: glBindFramebuffer] #{} tid={} target=0x{:x} fbo={}",
-            call, tid, target, framebuffer);
+        logAll(LogLevel::Info,
+               "[Probe 2: glBindFramebuffer] #{} tid={} target=0x{:x} fbo={}",
+               call, tid, target, framebuffer);
     }
 
     const size_t idx = mod.mFrameBindCount.fetch_add(1, std::memory_order_relaxed);
@@ -315,9 +571,8 @@ void LodPocMod::bindFramebufferDetour(GLenum target, GLuint framebuffer) {
 
 EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
     auto &mod = LodPocMod::instance();
-    auto &self = mod.getSelf();
 
-    // Call original first
+    // Call original first (never skip if non-null)
     const auto orig = mod.mOriginalSwapBuffers;
     const EGLBoolean res = orig ? orig(dpy, surf) : EGL_TRUE;
 
@@ -325,9 +580,9 @@ EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
     const pid_t tid = getThreadId();
 
     if (frame <= 20) {
-        self.getLogger().info(
-            "[Probe 3: eglSwapBuffers] #{} tid={} dpy={:p} surf={:p}",
-            frame, tid, dpy, surf);
+        logAll(LogLevel::Info,
+               "[Probe 3: eglSwapBuffers] #{} tid={} dpy={:p} surf={:p}",
+               frame, tid, dpy, surf);
     }
 
     // Probe 2 per-frame FBO sequence report every 120 frames
@@ -344,14 +599,14 @@ EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
         if (totalBinds > kMaxFrameBinds) {
             bindsStr += ", ...";
         }
-        self.getLogger().info(
-            "[Probe 2: glBindFramebuffer] frame {}: binds [{}] (total={}), tid={}",
-            frame, bindsStr, totalBinds, tid);
+        logAll(LogLevel::Info,
+               "[Probe 2: glBindFramebuffer] frame {}: binds [{}] (total={}), tid={}",
+               frame, bindsStr, totalBinds, tid);
     } else {
         mod.mFrameBindCount.store(0, std::memory_order_relaxed);
     }
 
-    // Probe 3 5-second FPS report
+    // Probe 3 5-second FPS report + alive heartbeat
     const auto now = std::chrono::steady_clock::now();
     if (now - mod.mLastFpsReport >= std::chrono::seconds(5)) {
         std::lock_guard lock(mod.mFpsMutex);
@@ -361,9 +616,9 @@ EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
             mod.mLastFpsFrame.store(frame, std::memory_order_relaxed);
             mod.mLastFpsReport = now;
             const double fps = (sec > 0.0) ? (static_cast<double>(frame - prev) / sec) : 0.0;
-            self.getLogger().info(
-                "[Probe 3: eglSwapBuffers] 5s Summary: fps={:.2f} (total_frames={}), tid={}",
-                fps, frame, tid);
+            logAll(LogLevel::Info,
+                   "[Probe 3: eglSwapBuffers] alive frame={} fps={:.2f} (total_frames={}), tid={}",
+                   frame, fps, frame, tid);
         }
     }
 
@@ -373,9 +628,8 @@ EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
 void *LodPocMod::cullPointOrChunkDetour(void *a0, void *a1, void *a2, void *a3,
                                         void *a4, void *a5, void *a6, void *a7) {
     auto &mod = LodPocMod::instance();
-    auto &self = mod.getSelf();
 
-    // Call original first forwarding all 8 args
+    // Call original first forwarding all 8 args (never skip if non-null)
     const auto orig = mod.mOriginalCull;
     void *const res = orig
                           ? orig(a0, a1, a2, a3, a4, a5, a6, a7)
@@ -395,9 +649,9 @@ void *LodPocMod::cullPointOrChunkDetour(void *a0, void *a1, void *a2, void *a3,
 
         if (call <= 20) {
             const pid_t tid = getThreadId();
-            self.getLogger().info(
-                "[Probe 5: cullPointOrChunk] #{} tid={} this={:p} pos=({:.2f}, {:.2f}, {:.2f}) dir=({:.2f}, {:.2f}, {:.2f})",
-                call, tid, thisPtr, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z);
+            logAll(LogLevel::Info,
+                   "[Probe 5: cullPointOrChunk] #{} tid={} this={:p} pos=({:.2f}, {:.2f}, {:.2f}) dir=({:.2f}, {:.2f}, {:.2f})",
+                   call, tid, thisPtr, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z);
         }
 
         const auto now = std::chrono::steady_clock::now();
@@ -410,9 +664,9 @@ void *LodPocMod::cullPointOrChunkDetour(void *a0, void *a1, void *a2, void *a3,
                 mod.mLastCullCalls.store(call, std::memory_order_relaxed);
                 mod.mLastCullReport = now;
                 const double rate = (sec > 0.0) ? (static_cast<double>(call - prev) / sec) : 0.0;
-                self.getLogger().info(
-                    "[Probe 5: cullPointOrChunk] 5s Summary: calls={}, rate={:.1f}/s, tid={}, pos=({:.2f}, {:.2f}, {:.2f}) dir=({:.2f}, {:.2f}, {:.2f})",
-                    call, rate, tid, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z);
+                logAll(LogLevel::Info,
+                       "[Probe 5: cullPointOrChunk] 5s Summary: calls={}, rate={:.1f}/s, tid={}, pos=({:.2f}, {:.2f}, {:.2f}) dir=({:.2f}, {:.2f}, {:.2f})",
+                       call, rate, tid, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z);
             }
         }
     }
