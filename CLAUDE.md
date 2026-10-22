@@ -35,8 +35,9 @@ foundation; no LOD terrain is injected into the game render pass.
 - CI: `.github/workflows/build.yml` builds with Android NDK r28c and publishes
   release assets for `v*` tags.
 - `v0.1.5` CI runs `39752366987` and `39752322134` were green.
-- The `0.1.6` world-reader changes were validated with host-side tests, but the
-  Android build must still be confirmed by GitHub Actions after pushing.
+- The first `0.1.6` CI attempt (`39762966634`) failed only on two references to
+  `LdbReader::ScanState`; `ScanState` is namespace-level. Fixed in `2796877`.
+- `0.1.6` CI run `39763771134` is green (Android build, package, artifact).
 
 Uncommitted-at-the-start files that were changed:
 
