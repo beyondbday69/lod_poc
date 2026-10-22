@@ -1,5 +1,6 @@
 #include "mod/LodPocMod.h"
 #include "mod/ElfDiag.h"
+#include "mod/PocQuad.h"
 #include "mod/WorldReader.h"
 #include "signatures.h"
 
@@ -316,6 +317,7 @@ bool LodPocMod::load() {
             const auto &cfg = mConfigFile->value();
             GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel, cfg.traceDelayAfterWorldSec);
             CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
+            PocQuad::instance().setConfig(cfg.pocQuad, cfg.pocDepth, cfg.pocColor, cfg.pocTrigger);
         }
         logAll(LogLevel::Info, "Loaded successfully");
         return true;
@@ -403,6 +405,7 @@ bool LodPocMod::disable() {
         removeProbes();
         restoreCrashHandlers();
         GlTrace::instance().remove();
+        PocQuad::instance().cleanup();
         CameraProbe::instance().reset();
         logAll(LogLevel::Info, "LOD PoC mod disabled");
         return true;
@@ -420,6 +423,7 @@ bool LodPocMod::unload() {
         removeProbes();
         restoreCrashHandlers();
         GlTrace::instance().remove();
+        PocQuad::instance().cleanup();
         CameraProbe::instance().reset();
         {
             std::lock_guard lock(mConfigMutex);
@@ -627,6 +631,7 @@ void LodPocMod::checkConfigReload() {
                 const auto &cfg = mConfigFile->value();
                 GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel, cfg.traceDelayAfterWorldSec);
                 CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
+                PocQuad::instance().setConfig(cfg.pocQuad, cfg.pocDepth, cfg.pocColor, cfg.pocTrigger);
             }
         }
     }

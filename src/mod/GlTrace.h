@@ -179,6 +179,9 @@ public:
     // Draw Tracking
     void onDraw(const RawDrawRecord &record);
 
+    bool isFbo0DepthInvalidated() const { return mFbo0DepthInvalidated; }
+    GLenum getCurrentDepthFunc() const { return mCurrentDepthFunc; }
+
     std::atomic<uint64_t> mPermanentFrameDraws{0};
 
     // Original GL function pointers

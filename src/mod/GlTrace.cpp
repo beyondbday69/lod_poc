@@ -1,5 +1,6 @@
 #include "mod/GlTrace.h"
 #include "mod/LodPocMod.h"
+#include "mod/PocQuad.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -167,6 +168,8 @@ void GlTrace::armTrace(const std::string &label) {
 void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
     const pid_t tid = gettid();
     setRenderThreadId(tid);
+
+    PocQuad::instance().onSwapBuffers(currentFps);
 
     const uint64_t frameDraws = mPermanentFrameDraws.exchange(0, std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
@@ -693,6 +696,18 @@ void GlTrace::onUseProgram(GLuint program) {
 
 void GlTrace::detourBindFramebuffer(GLenum target, GLuint framebuffer) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigBindFramebuffer != nullptr) inst.mOrigBindFramebuffer(target, framebuffer);
+        return;
+    }
+
+    if (PocQuad::instance().isEnabled()) {
+        uint64_t frameDraws = inst.mPermanentFrameDraws.load(std::memory_order_relaxed);
+        if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
+            PocQuad::instance().onBindFramebufferBefore(framebuffer, inst.mCurrentBoundDrawFbo, frameDraws, inst.mCurrentDepthFunc, inst.mFbo0DepthInvalidated);
+        }
+    }
+
     if (inst.mOrigBindFramebuffer != nullptr) {
         inst.mOrigBindFramebuffer(target, framebuffer);
     }
@@ -702,6 +717,10 @@ void GlTrace::detourBindFramebuffer(GLenum target, GLuint framebuffer) {
 
 void GlTrace::detourBindTexture(GLenum target, GLuint texture) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigBindTexture != nullptr) inst.mOrigBindTexture(target, texture);
+        return;
+    }
     if (inst.mOrigBindTexture != nullptr) inst.mOrigBindTexture(target, texture);
     inst.onBindTexture(target, texture);
 }
@@ -756,36 +775,60 @@ void GlTrace::detourDrawBuffers(GLsizei n, const GLenum *bufs) {
 
 void GlTrace::detourViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigViewport != nullptr) inst.mOrigViewport(x, y, width, height);
+        return;
+    }
     if (inst.mOrigViewport != nullptr) inst.mOrigViewport(x, y, width, height);
     inst.onViewport(x, y, width, height);
 }
 
 void GlTrace::detourEnable(GLenum cap) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigEnable != nullptr) inst.mOrigEnable(cap);
+        return;
+    }
     if (inst.mOrigEnable != nullptr) inst.mOrigEnable(cap);
     inst.onEnable(cap);
 }
 
 void GlTrace::detourDisable(GLenum cap) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigDisable != nullptr) inst.mOrigDisable(cap);
+        return;
+    }
     if (inst.mOrigDisable != nullptr) inst.mOrigDisable(cap);
     inst.onDisable(cap);
 }
 
 void GlTrace::detourDepthMask(GLboolean flag) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigDepthMask != nullptr) inst.mOrigDepthMask(flag);
+        return;
+    }
     if (inst.mOrigDepthMask != nullptr) inst.mOrigDepthMask(flag);
     inst.onDepthMask(flag);
 }
 
 void GlTrace::detourUseProgram(GLuint program) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigUseProgram != nullptr) inst.mOrigUseProgram(program);
+        return;
+    }
     if (inst.mOrigUseProgram != nullptr) inst.mOrigUseProgram(program);
     inst.onUseProgram(program);
 }
 
 void GlTrace::detourDrawArrays(GLenum mode, GLint first, GLsizei count) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigDrawArrays != nullptr) inst.mOrigDrawArrays(mode, first, count);
+        return;
+    }
     if (inst.mOrigDrawArrays != nullptr) inst.mOrigDrawArrays(mode, first, count);
     RawDrawRecord rec;
     rec.functionName = "glDrawArrays";
@@ -798,6 +841,10 @@ void GlTrace::detourDrawArrays(GLenum mode, GLint first, GLsizei count) {
 
 void GlTrace::detourDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigDrawArraysInstanced != nullptr) inst.mOrigDrawArraysInstanced(mode, first, count, instancecount);
+        return;
+    }
     if (inst.mOrigDrawArraysInstanced != nullptr) inst.mOrigDrawArraysInstanced(mode, first, count, instancecount);
     inst.mPermanentFrameDraws.fetch_add(1, std::memory_order_relaxed);
     if (inst.mState.load(std::memory_order_relaxed) == TraceState::Recording) {
@@ -813,6 +860,10 @@ void GlTrace::detourDrawArraysInstanced(GLenum mode, GLint first, GLsizei count,
 
 void GlTrace::detourDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigDrawElements != nullptr) inst.mOrigDrawElements(mode, count, type, indices);
+        return;
+    }
     if (inst.mOrigDrawElements != nullptr) inst.mOrigDrawElements(mode, count, type, indices);
     inst.mPermanentFrameDraws.fetch_add(1, std::memory_order_relaxed);
     if (inst.mState.load(std::memory_order_relaxed) == TraceState::Recording) {
@@ -829,6 +880,10 @@ void GlTrace::detourDrawElements(GLenum mode, GLsizei count, GLenum type, const 
 
 void GlTrace::detourDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigDrawElementsInstanced != nullptr) inst.mOrigDrawElementsInstanced(mode, count, type, indices, instancecount);
+        return;
+    }
     if (inst.mOrigDrawElementsInstanced != nullptr) inst.mOrigDrawElementsInstanced(mode, count, type, indices, instancecount);
     inst.mPermanentFrameDraws.fetch_add(1, std::memory_order_relaxed);
     if (inst.mState.load(std::memory_order_relaxed) == TraceState::Recording) {
@@ -962,14 +1017,20 @@ void GlTrace::detourMultiDrawElementsEXT(GLenum mode, const GLsizei *count, GLen
 
 void GlTrace::detourDepthFunc(GLenum func) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigDepthFunc != nullptr) inst.mOrigDepthFunc(func);
+        return;
+    }
     if (inst.mOrigDepthFunc != nullptr) inst.mOrigDepthFunc(func);
-    if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
-    if (gettid() != inst.getRenderThreadId()) return;
     inst.mCurrentDepthFunc = func;
 }
 
 void GlTrace::detourDepthRangef(GLfloat n, GLfloat f) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigDepthRangef != nullptr) inst.mOrigDepthRangef(n, f);
+        return;
+    }
     if (inst.mOrigDepthRangef != nullptr) inst.mOrigDepthRangef(n, f);
     if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
     if (gettid() != inst.getRenderThreadId()) return;
@@ -990,6 +1051,10 @@ void GlTrace::detourBlendFunc(GLenum sfactor, GLenum dfactor) {
 
 void GlTrace::detourBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigBlendFuncSeparate != nullptr) inst.mOrigBlendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha);
+        return;
+    }
     if (inst.mOrigBlendFuncSeparate != nullptr) inst.mOrigBlendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha);
     if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
     if (gettid() != inst.getRenderThreadId()) return;
@@ -1001,6 +1066,10 @@ void GlTrace::detourBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAl
 
 void GlTrace::detourCullFace(GLenum mode) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigCullFace != nullptr) inst.mOrigCullFace(mode);
+        return;
+    }
     if (inst.mOrigCullFace != nullptr) inst.mOrigCullFace(mode);
     if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
     if (gettid() != inst.getRenderThreadId()) return;
@@ -1017,7 +1086,18 @@ void GlTrace::detourClearDepthf(GLfloat depth) {
 
 void GlTrace::detourClear(GLbitfield mask) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigClear != nullptr) inst.mOrigClear(mask);
+        return;
+    }
+
     if (inst.mOrigClear != nullptr) inst.mOrigClear(mask);
+
+    if (PocQuad::instance().isEnabled()) {
+        uint64_t frameDraws = inst.mPermanentFrameDraws.load(std::memory_order_relaxed);
+        PocQuad::instance().onClearAfter(mask, inst.mCurrentBoundDrawFbo, frameDraws, inst.mCurrentDepthFunc);
+    }
+
     if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
     if (gettid() != inst.getRenderThreadId()) return;
 
@@ -1184,6 +1264,10 @@ void GlTrace::detourUniform4fv(GLint location, GLsizei count, const GLfloat *val
 
 void GlTrace::detourBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigBindBufferBase != nullptr) inst.mOrigBindBufferBase(target, index, buffer);
+        return;
+    }
     if (inst.mOrigBindBufferBase != nullptr) inst.mOrigBindBufferBase(target, index, buffer);
     if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
     if (gettid() != inst.getRenderThreadId()) return;
@@ -1198,6 +1282,10 @@ void GlTrace::detourBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
 
 void GlTrace::detourBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
     auto &inst = GlTrace::instance();
+    if (PocQuad::isRendering()) {
+        if (inst.mOrigBindBufferRange != nullptr) inst.mOrigBindBufferRange(target, index, buffer, offset, size);
+        return;
+    }
     if (inst.mOrigBindBufferRange != nullptr) inst.mOrigBindBufferRange(target, index, buffer, offset, size);
     if (inst.mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
     if (gettid() != inst.getRenderThreadId()) return;
@@ -1439,6 +1527,14 @@ void GlTrace::install() {
     hookPermanent("glDrawArraysInstanced", {"glDrawArraysInstancedEXT", "glDrawArraysInstancedOES"},
                   reinterpret_cast<void *>(&detourDrawArraysInstanced),
                   reinterpret_cast<void **>(&mOrigDrawArraysInstanced));
+
+    hookPermanent("glClear", {},
+                  reinterpret_cast<void *>(&detourClear),
+                  reinterpret_cast<void **>(&mOrigClear));
+
+    hookPermanent("glDepthFunc", {},
+                  reinterpret_cast<void *>(&detourDepthFunc),
+                  reinterpret_cast<void **>(&mOrigDepthFunc));
 }
 
 void GlTrace::remove() {
@@ -1448,6 +1544,8 @@ void GlTrace::remove() {
     mOrigDrawElements = nullptr;
     mOrigDrawElementsInstanced = nullptr;
     mOrigDrawArraysInstanced = nullptr;
+    mOrigClear = nullptr;
+    mOrigDepthFunc = nullptr;
 }
 
 void GlTrace::installHeavyHooks() {
@@ -1515,14 +1613,12 @@ void GlTrace::installHeavyHooks() {
     hookFn("glDepthMask", {}, reinterpret_cast<void *>(&detourDepthMask), reinterpret_cast<void **>(&mOrigDepthMask));
     hookFn("glUseProgram", {}, reinterpret_cast<void *>(&detourUseProgram), reinterpret_cast<void **>(&mOrigUseProgram));
 
-    // Stage 1: Depth, Blend, Cull, Clear, Invalidate, Uniforms & Buffers
-    hookFn("glDepthFunc", {}, reinterpret_cast<void *>(&detourDepthFunc), reinterpret_cast<void **>(&mOrigDepthFunc));
+    // Stage 1: Depth, Blend, Cull, Invalidate, Uniforms & Buffers
     hookFn("glDepthRangef", {}, reinterpret_cast<void *>(&detourDepthRangef), reinterpret_cast<void **>(&mOrigDepthRangef));
     hookFn("glBlendFunc", {}, reinterpret_cast<void *>(&detourBlendFunc), reinterpret_cast<void **>(&mOrigBlendFunc));
     hookFn("glBlendFuncSeparate", {}, reinterpret_cast<void *>(&detourBlendFuncSeparate), reinterpret_cast<void **>(&mOrigBlendFuncSeparate));
     hookFn("glCullFace", {}, reinterpret_cast<void *>(&detourCullFace), reinterpret_cast<void **>(&mOrigCullFace));
     hookFn("glClearDepthf", {"glClearDepth"}, reinterpret_cast<void *>(&detourClearDepthf), reinterpret_cast<void **>(&mOrigClearDepthf));
-    hookFn("glClear", {}, reinterpret_cast<void *>(&detourClear), reinterpret_cast<void **>(&mOrigClear));
     hookFn("glInvalidateFramebuffer", {}, reinterpret_cast<void *>(&detourInvalidateFramebuffer), reinterpret_cast<void **>(&mOrigInvalidateFramebuffer));
     hookFn("glInvalidateSubFramebuffer", {}, reinterpret_cast<void *>(&detourInvalidateSubFramebuffer), reinterpret_cast<void **>(&mOrigInvalidateSubFramebuffer));
     hookFn("glDiscardFramebufferEXT", {"glDiscardFramebufferOES"}, reinterpret_cast<void *>(&detourDiscardFramebufferEXT), reinterpret_cast<void **>(&mOrigDiscardFramebufferEXT));
@@ -1560,13 +1656,11 @@ void GlTrace::removeHeavyHooks() {
     mOrigDepthMask = nullptr;
     mOrigUseProgram = nullptr;
 
-    mOrigDepthFunc = nullptr;
     mOrigDepthRangef = nullptr;
     mOrigBlendFunc = nullptr;
     mOrigBlendFuncSeparate = nullptr;
     mOrigCullFace = nullptr;
     mOrigClearDepthf = nullptr;
-    mOrigClear = nullptr;
     mOrigInvalidateFramebuffer = nullptr;
     mOrigInvalidateSubFramebuffer = nullptr;
     mOrigDiscardFramebufferEXT = nullptr;

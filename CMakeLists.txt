@@ -120,6 +120,7 @@ add_library(${MOD_LIBRARY_NAME} SHARED
     src/mod/LodMesh.cpp
     src/mod/LodPocMod.cpp
     src/mod/PngWriter.cpp
+    src/mod/PocQuad.cpp
     src/mod/WorldReader.cpp)
 
 set_target_properties(${MOD_LIBRARY_NAME} PROPERTIES

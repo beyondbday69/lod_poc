@@ -71,6 +71,42 @@ This repository implements **log-only, non-intrusive diagnostic probes** designe
 
 ---
 
+## Stage 2: Depth-Tested Test Quad (`pocQuad`)
+
+### Purpose & What It Tests
+Stage 2 provides a visual, non-intrusive test that verifies the OpenGL ES depth buffer behavior and rendering pipeline in Minecraft Bedrock on real hardware:
+1. **Depth Buffer Verification**: Injects a fullscreen quad rendered with clip-space depth $Z_{NDC} = \text{pocDepth} \times 2 - 1$ directly into Bedrock's main world framebuffer (`FBO 0`) with `GL_DEPTH_TEST` enabled (depth func `GL_LEQUAL` matching terrain) and depth write mask disabled.
+2. **Terrain Occlusion**:
+   - At `pocDepth = 0.0` ($Z = -1.0$, near plane), the quad appears in front of all world terrain.
+   - At `pocDepth = 0.5` ($Z = 0.0$), terrain blocks closer than mid-depth occlude the quad, while further terrain blocks are hidden behind the quad.
+   - At `pocDepth = 1.0` ($Z = +1.0$, far plane), all terrain blocks occlude the quad (only visible in empty sky).
+3. **Pipeline Trigger Points**:
+   - `"before_fbo1"`: Drawn inside `glBindFramebuffer` immediately before Bedrock transitions from world rendering on `FBO 0` to post-processing on `FBO 1`.
+   - `"after_depth_clear"`: Drawn inside `glClear` immediately after `GL_DEPTH_BUFFER_BIT` clear on `FBO 0`.
+4. **Zero-Impact State Isolation**:
+   - Saves and restores every OpenGL ES state touched (`GL_CURRENT_PROGRAM`, VAO, VBO, EBO, texture unit & binding, UBOs 0..3, viewport, scissor, depth test/mask/func/range, blend enable/factors/equation, cull face, stencil, color mask, and draw/read FBOs).
+   - Thread-local re-entrancy guard ensures mod draw calls never re-trigger detours.
+   - Built-in kill switch shuts down the quad permanently if any OpenGL error (`glGetError`) occurs.
+5. **Live Reload**:
+   - Change `pocQuad`, `pocDepth`, `pocColor`, or `pocTrigger` in `config.json` while the game is running. The mod detects file changes every 2 seconds and updates live without restarting.
+
+### How to Enable & Test
+In `<mod_config_dir>/config.json` (or `<mod_data_dir>/config.json`):
+```json
+{
+  "pocQuad": true,
+  "pocDepth": 0.5,
+  "pocColor": "ff00ff",
+  "pocTrigger": "before_fbo1"
+}
+```
+Telemetry logs once per second while active:
+```text
+[PocQuad] Telemetry: draws=60, depth=0.500 (NDC z=0.000), func=LEQUAL, invalidated=false, fps=59.8
+```
+
+---
+
 ## Configuration (`config.json`)
 
 Stored in `<mod_config_dir>/config.json` (or `<mod_data_dir>/config.json`):
@@ -81,6 +117,10 @@ Stored in `<mod_config_dir>/config.json` (or `<mod_data_dir>/config.json`):
 | `traceRaw` | boolean | `false` | When `false`, writes only the compact pass segment summary (~20 lines). When `true`, also dumps raw arguments for every draw call. |
 | `traceLabel` | string | `""` | User label for manual re-arming (e.g. set to `"inventory"` or `"paused"` to capture a specific state). |
 | `traceDelayAfterWorldSec` | integer | `10` | Delay in seconds after world detection (60 consecutive frames >500 draws) before capturing the in-world GL trace. |
+| `pocQuad` | boolean | `false` | Stage 2: Enables live depth-tested test quad rendering into FBO 0. Zero overhead when false. |
+| `pocDepth` | float (0..1) | `0.5` | Clip-space depth setting for test quad ($z_{NDC} = \text{depth} \times 2 - 1$). `0.0` = near plane, `1.0` = far plane. |
+| `pocColor` | string | `"ff00ff"` | Hex color string for test quad (`"rrggbb"` or `"rrggbbaa"`). Default is magenta (`#ff00ff`). |
+| `pocTrigger` | string | `"before_fbo1"` | Trigger point: `"before_fbo1"` (draw into FBO 0 immediately before switching to FBO 1) or `"after_depth_clear"` (draw immediately after `glClear(DEPTH)` on FBO 0). |
 | `probeCameraDiff` | boolean | `true` | Enables Probe B 3-snapshot memory diffing on `cullPointOrChunk`. |
 | `userNote` | string | `""` | Free-form notes with your recorded player coordinates at T1/T2/T3. |
 | `requireKnownBuild` | boolean | `true` | When true (default), signature-based probes are skipped if the loaded `libminecraftpe.so` GNU build-id does not match `712509dc14ccc233e91f267937dfb46ecdcc4b68`. |

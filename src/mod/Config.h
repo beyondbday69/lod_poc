@@ -42,6 +42,12 @@ struct ModConfig {
 
     /** Build-ID safety gate: require known RE binary for signature-based hooks */
     bool requireKnownBuild = true;
+
+    /** Stage 2: Depth-tested test quad */
+    bool pocQuad = false;
+    float pocDepth = 0.5f;
+    std::string pocColor = "ff00ff";
+    std::string pocTrigger = "before_fbo1";
 };
 
 nlohmann::json makeDefaultConfigJson();
