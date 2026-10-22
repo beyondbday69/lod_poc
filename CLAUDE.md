@@ -388,6 +388,15 @@ host-only artifacts under `/tmp`.
 10. **CRC is not validated.** The reader reads the 4-byte trailer CRC but does
     not reject mismatches; malformed data is caught by bounds checks and block
     parsers instead.
+11. **Data3D fallback is one block high.** The device cross-check showed
+    `Data3D raw - 64 = SubChunk top + 1`; use `raw - 65` if a future patch makes
+    fallback heights match SubChunk top-block Y exactly.
+12. **Mushrooms are not in the decoration skip list yet.** The v0.1.6 test map
+    had one `red_mushroom` top column. Add `red_mushroom` and
+    `brown_mushroom` to `isSkippableDecoration()` if a patch is made.
+13. **Maps only cover `.ldb` chunks.** The `.log` WAL/memtable is not parsed, so
+    recently loaded/saved chunks may be missing from the map until compaction
+    writes them to `.ldb`.
 
 ---
 
@@ -424,6 +433,38 @@ Expected test procedure for `0.1.6`:
    4). Do not “fix” it by swapping only one call site.
 7. If all columns are dark gray, inspect `Data2D(unsupported)`, SubChunk
    version counts, and parse-error counts before assuming a layout bug.
+
+### 9.1 Actual v0.1.6 verification (2026-10-22)
+
+A real device session produced `/root/lod_poc/lod_poc.log` and
+`/root/lod_poc/lod_map.png`:
+
+- Build-ID matched the expected
+  `712509dc14ccc233e91f267937dfb46ecdcc4b68` exactly; renderer Adreno 710.
+- `waiting for world...` logged at 16:13:11.038; the DB was discovered at
+  16:13:26.058, about 15 seconds later.
+- One `.ldb` file (0.17 MB). 654 records: 559 Overworld, 551 values,
+  8 deletions, 2 dimension keys ignored, 93 other keys ignored, 0 malformed.
+- 35 Data3D records, 317 SubChunk records, 0 Data2D.
+- All 317 SubChunks were v9. 0 parse errors, 0 Y-index mismatches,
+  0 out-of-range SubChunks.
+- 35 chunks / 8960 columns finalized: **resolved=8960, unresolved=0,
+  parse-error=0**.
+- Top blocks: grass 6659, water 1349, oak leaves 439, stone 173, birch leaves
+  143, leaf litter 100, plus small amounts of granite, diorite, gravel,
+  andesite, sand, oak logs, iron ore, and one red mushroom.
+- Map: 176×176 pixels at scale 1:1 (11×11 chunk bounds), written both next to
+  the log and to `/storage/emulated/0/Download/lod_map.png`.
+- Image histogram: no magenta `(255,0,255)` and no unresolved `(64,64,64)`.
+  The dominant dark gray `(40,40,40)` is map background/void, not an error.
+- Data3D cross-check: for all 10 sampled chunks,
+  `top - (raw - 64) = -1` and `top - raw = -65`. In other words, Data3D stores
+  a height one block above the SubChunk top (consistent with a first-air
+  heightmap). SubChunk data is authoritative, so this did not affect the map;
+  the `raw - 64` fallback is one block high if it is ever used.
+- The map is intentionally partial: only chunks already present in immutable
+  `.ldb` files are read. This world had 35 such chunks; the `.log` WAL is not
+  parsed.
 
 ---
 
