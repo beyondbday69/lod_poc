@@ -10,20 +10,6 @@ namespace lod_poc {
 
 namespace {
 
-const char *capToString(GLenum cap) {
-    switch (cap) {
-        case 0x0B71: return "GL_DEPTH_TEST";
-        case 0x0BE2: return "GL_BLEND";
-        case 0x0B44: return "GL_CULL_FACE";
-        case 0x0C11: return "GL_SCISSOR_TEST";
-        case 0x0B90: return "GL_STENCIL_TEST";
-        case 0x8037: return "GL_POLYGON_OFFSET_FILL";
-        case 0x809E: return "GL_SAMPLE_ALPHA_TO_COVERAGE";
-        case 0x80A0: return "GL_SAMPLE_COVERAGE";
-        default:     return nullptr;
-    }
-}
-
 const char *modeToString(GLenum mode) {
     switch (mode) {
         case GL_POINTS:         return "POINTS";
@@ -37,12 +23,31 @@ const char *modeToString(GLenum mode) {
     }
 }
 
-std::string formatClearMask(GLbitfield mask) {
-    std::string s;
-    if (mask & GL_COLOR_BUFFER_BIT) s += "COLOR ";
-    if (mask & GL_DEPTH_BUFFER_BIT) s += "DEPTH ";
-    if (mask & GL_STENCIL_BUFFER_BIT) s += "STENCIL ";
-    return s.empty() ? "NONE" : s;
+const char *typeToString(GLenum type) {
+    switch (type) {
+        case GL_UNSIGNED_BYTE:  return "UNSIGNED_BYTE";
+        case GL_UNSIGNED_SHORT: return "UNSIGNED_SHORT";
+        case GL_UNSIGNED_INT:   return "UNSIGNED_INT";
+        default:                return "UNKNOWN";
+    }
+}
+
+const char *internalFormatToString(GLenum fmt) {
+    switch (fmt) {
+        case 0x8058: return "RGBA8";
+        case 0x8051: return "RGB8";
+        case 0x8056: return "RGBA4";
+        case 0x8057: return "RGB5_A1";
+        case 0x8D62: return "RGB565";
+        case 0x81A5: return "DEPTH24";
+        case 0x81A6: return "DEPTH32";
+        case 0x81A7: return "DEPTH24_STENCIL8";
+        case 0x88F0: return "DEPTH32F_STENCIL8";
+        case 0x8D70: return "RGBA8UI";
+        case 0x881A: return "RGBA16F";
+        case 0x8814: return "RGBA32F";
+        default:     return "UNKNOWN";
+    }
 }
 
 } // namespace
@@ -52,13 +57,12 @@ GlTrace &GlTrace::instance() {
     return sInstance;
 }
 
-GlTrace::GlTrace() {
-    mEvents.resize(kMaxEvents);
-}
+GlTrace::GlTrace() = default;
 
-void GlTrace::setConfig(bool traceFrame, const std::string &traceLabel) {
+void GlTrace::setConfig(bool traceFrame, bool traceRaw, const std::string &traceLabel) {
     std::lock_guard lock(mStateMutex);
     mConfigTraceFrame = traceFrame;
+    mConfigTraceRaw = traceRaw;
     mConfigTraceLabel = traceLabel;
     if (traceFrame && !traceLabel.empty() && traceLabel != mLastTracedLabel) {
         armTrace(traceLabel);
@@ -68,11 +72,14 @@ void GlTrace::setConfig(bool traceFrame, const std::string &traceLabel) {
 void GlTrace::armTrace(const std::string &label) {
     std::lock_guard lock(mStateMutex);
     mArmedLabel = label;
+    if (!mHeavyHooksInstalled) {
+        installHeavyHooks();
+    }
     mState.store(TraceState::Armed, std::memory_order_release);
-    LodPocMod::logAll(LogLevel::Info, "[Probe A: GLTrace] Armed for single-frame trace: '{}'", label);
+    LodPocMod::logAll(LogLevel::Info, "[GLTrace] Armed for single-frame trace: '{}'", label);
 }
 
-void GlTrace::onSwapBuffers(uint64_t frameCount) {
+void GlTrace::onSwapBuffers(uint64_t frameCount, double currentFps) {
     const pid_t tid = gettid();
     setRenderThreadId(tid);
 
@@ -84,10 +91,16 @@ void GlTrace::onSwapBuffers(uint64_t frameCount) {
     // If currently recording, this swap buffers marks the END of the traced frame!
     if (currentState == TraceState::Recording) {
         mState.store(TraceState::Idle, std::memory_order_release);
-        size_t count = mEventCount.load(std::memory_order_acquire);
         std::string label = mActiveLabel;
         mLastTracedLabel = label;
-        dumpCompressedSummary(label, count);
+
+        dumpPassSummary(label);
+
+        // Remove heavy hooks after tracing to recover game FPS!
+        removeHeavyHooks();
+        LodPocMod::logAll(LogLevel::Info,
+                          "[GLTrace] Traced frame finished. Heavy hooks removed. (FPS before trace: {:.1f}, current: {:.1f})",
+                          mLastRecordedFps, currentFps);
         return;
     }
 
@@ -95,11 +108,17 @@ void GlTrace::onSwapBuffers(uint64_t frameCount) {
     if (currentState == TraceState::Armed) {
         std::lock_guard lock(mStateMutex);
         mActiveLabel = mArmedLabel;
-        mEventCount.store(0, std::memory_order_relaxed);
-        mRunningDrawIndex.store(0, std::memory_order_relaxed);
+        mLastRecordedFps = currentFps;
+
+        {
+            std::lock_guard segLock(mFrameSegmentsMutex);
+            mCurrentFrameSegments.clear();
+            startNewSegment(mCurrentBoundDrawFbo);
+        }
+
         mState.store(TraceState::Recording, std::memory_order_release);
         LodPocMod::logAll(LogLevel::Info,
-                          "[Probe A: GLTrace] Began recording frame trace: '{}' at frame #{} (tid={})",
+                          "[GLTrace] Began recording frame trace: '{}' at frame #{} (tid={})",
                           mActiveLabel, frameCount, tid);
         return;
     }
@@ -117,7 +136,7 @@ void GlTrace::onSwapBuffers(uint64_t frameCount) {
         if (frameDraws > 500 && mFirstHeavyFrameTime == std::chrono::steady_clock::time_point{}) {
             mFirstHeavyFrameTime = now;
             LodPocMod::logAll(LogLevel::Info,
-                              "[Probe A: GLTrace] In-world heavy draw detected (#{} draws in frame {}). Arming in-world trace in ~10s.",
+                              "[GLTrace] In-world heavy draw detected (#{} draws in frame {}). Arming in-world trace in ~10s.",
                               frameDraws, frameCount);
         }
 
@@ -132,273 +151,307 @@ void GlTrace::onSwapBuffers(uint64_t frameCount) {
     }
 }
 
-void GlTrace::recordEvent(const GlEvent &ev) {
-    size_t idx = mEventCount.fetch_add(1, std::memory_order_relaxed);
-    if (idx < kMaxEvents) {
-        mEvents[idx] = ev;
+std::string GlTrace::buildAttachmentDesc(GLuint fboId) {
+    if (fboId == 0) {
+        return "Default Screen (FBO 0)";
+    }
+    auto it = mFboMap.find(fboId);
+    if (it == mFboMap.end()) {
+        return "Unknown FBO";
+    }
+    const auto &desc = it->second;
+    std::string s;
+    for (const auto &pair : desc.colors) {
+        const auto &img = pair.second;
+        s += fmt::format("Color[0x{:x}]: id={} {}x{} fmt=0x{:x} ({}); ",
+                         pair.first, img.id, img.width, img.height,
+                         img.internalFormat, internalFormatToString(img.internalFormat));
+    }
+    if (desc.depth.id != 0) {
+        s += fmt::format("Depth: id={} {}x{} fmt=0x{:x} ({}); ",
+                         desc.depth.id, desc.depth.width, desc.depth.height,
+                         desc.depth.internalFormat, internalFormatToString(desc.depth.internalFormat));
+    }
+    if (desc.stencil.id != 0) {
+        s += fmt::format("Stencil: id={} {}x{} fmt=0x{:x}; ",
+                         desc.stencil.id, desc.stencil.width, desc.stencil.height,
+                         desc.stencil.internalFormat);
+    }
+    return s.empty() ? "None" : s;
+}
+
+void GlTrace::startNewSegment(GLuint fboId) {
+    PassSegment seg;
+    seg.segmentIndex = static_cast<uint32_t>(mCurrentFrameSegments.size() + 1);
+    seg.fboId = fboId;
+    seg.vpX = mCurrentVpX;
+    seg.vpY = mCurrentVpY;
+    seg.vpW = mCurrentVpW;
+    seg.vpH = mCurrentVpH;
+    seg.attachmentSummary = buildAttachmentDesc(fboId);
+    seg.depthTestEnabled = mCurrentDepthTest;
+    seg.depthMaskEnabled = mCurrentDepthMask;
+    seg.blendEnabled = mCurrentBlend;
+    if (mCurrentProgram != 0) {
+        seg.distinctPrograms.insert(mCurrentProgram);
+    }
+    mCurrentFrameSegments.push_back(seg);
+}
+
+void GlTrace::onDraw(const RawDrawRecord &record) {
+    if (mState.load(std::memory_order_relaxed) != TraceState::Recording) return;
+    if (gettid() != getRenderThreadId()) return;
+
+    std::lock_guard lock(mFrameSegmentsMutex);
+    if (mCurrentFrameSegments.empty()) {
+        startNewSegment(mCurrentBoundDrawFbo);
+    }
+    auto &seg = mCurrentFrameSegments.back();
+
+    seg.totalDrawCalls++;
+    uint64_t vCount = static_cast<uint64_t>(record.count);
+    if (record.primCount > 0) {
+        vCount = static_cast<uint64_t>(record.count) * record.primCount;
+    }
+    seg.sumVertexCount += vCount;
+    seg.sumInstanceCount += static_cast<uint64_t>(record.instanceCount);
+    seg.drawsByFunction[record.functionName]++;
+
+    if (mCurrentDepthTest) seg.depthTestEnabled = true;
+    if (mCurrentBlend) seg.blendEnabled = true;
+    seg.depthMaskEnabled = mCurrentDepthMask;
+    if (mCurrentProgram != 0) {
+        seg.distinctPrograms.insert(mCurrentProgram);
+    }
+
+    if (mConfigTraceRaw) {
+        seg.rawDraws.push_back(record);
     }
 }
 
-void GlTrace::dumpCompressedSummary(const std::string &label, size_t count) {
-    const size_t totalEvents = std::min(count, kMaxEvents);
-    LodPocMod::logAll(LogLevel::Info,
-                      "[Probe A: GLTrace] ==================== FRAME TRACE: {} ====================",
-                      label);
-    LodPocMod::logAll(LogLevel::Info,
-                      "[Probe A: GLTrace] Recorded {} events (capped at {})",
-                      count, kMaxEvents);
+void GlTrace::dumpPassSummary(const std::string &label) {
+    std::lock_guard lock(mFrameSegmentsMutex);
 
-    uint32_t drawsSinceLastStateChange = 0;
-    bool depthTestOn = false;
-    uint32_t currentRunDepthOn = 0;
-    uint32_t maxRunDepthOn = 0;
-    int32_t lastDepthClearDrawIndex = -1;
-    int32_t firstDrawAfterLastDepthClear = -1;
-    int32_t uiStartCandidate = -1;
-    uint32_t totalDrawCalls = 0;
+    LodPocMod::logAll(LogLevel::Info, "==================== PASS SUMMARY: {} ====================", label);
+    LodPocMod::logAll(LogLevel::Info, "Total FBO Pass Segments: {}", mCurrentFrameSegments.size());
 
-    // Helper to flush accumulated draw runs
-    int collapsedDraws = 0;
-    GLenum collapsedMode = 0;
-    GLsizei collapsedCount = 0;
-    GlEventType collapsedType = GlEventType::Clear;
-
-    auto flushCollapsedDraws = [&]() {
-        if (collapsedDraws > 0) {
-            LodPocMod::logAll(LogLevel::Info,
-                              "[GLTrace]   -> DRAW x {} (type={}, mode=0x{:x} [{}], count={})",
-                              collapsedDraws,
-                              collapsedType == GlEventType::DrawElements ? "DrawElements" : "DrawArrays",
-                              collapsedMode, modeToString(collapsedMode), collapsedCount);
-            collapsedDraws = 0;
-        }
+    struct Candidate {
+        size_t segIndex;
+        uint32_t fboId;
+        uint64_t sumCount;
+        size_t distinctProgs;
     };
+    std::vector<Candidate> depthCandidates;
 
-    for (size_t i = 0; i < totalEvents; ++i) {
-        const auto &ev = mEvents[i];
+    for (size_t i = 0; i < mCurrentFrameSegments.size(); ++i) {
+        const auto &seg = mCurrentFrameSegments[i];
 
-        if (ev.type == GlEventType::DrawElements || ev.type == GlEventType::DrawArrays ||
-            ev.type == GlEventType::DrawElementsInstanced || ev.type == GlEventType::DrawArraysInstanced) {
+        std::string funcBreakdown;
+        for (const auto &pair : seg.drawsByFunction) {
+            if (!funcBreakdown.empty()) funcBreakdown += ", ";
+            funcBreakdown += fmt::format("{}: {}", pair.first, pair.second);
+        }
+        if (funcBreakdown.empty()) funcBreakdown = "None";
 
-            totalDrawCalls++;
-            drawsSinceLastStateChange++;
-
-            if (depthTestOn) {
-                currentRunDepthOn++;
-                if (currentRunDepthOn > maxRunDepthOn) {
-                    maxRunDepthOn = currentRunDepthOn;
-                }
-            }
-
-            if (lastDepthClearDrawIndex >= 0 && firstDrawAfterLastDepthClear < 0) {
-                firstDrawAfterLastDepthClear = static_cast<int32_t>(ev.drawCallIndex);
-            }
-
-            // Check if identical to current collapsed run
-            GLenum mode = (ev.type == GlEventType::DrawElements) ? ev.drawElements.mode : ev.drawArrays.mode;
-            GLsizei countVal = (ev.type == GlEventType::DrawElements) ? ev.drawElements.count : ev.drawArrays.count;
-
-            if (collapsedDraws > 0 && collapsedType == ev.type && collapsedMode == mode && collapsedCount == countVal) {
-                collapsedDraws++;
-            } else {
-                flushCollapsedDraws();
-                collapsedType = ev.type;
-                collapsedMode = mode;
-                collapsedCount = countVal;
-                collapsedDraws = 1;
-            }
-            continue;
+        std::string progsList;
+        for (GLuint p : seg.distinctPrograms) {
+            if (!progsList.empty()) progsList += ", ";
+            progsList += std::to_string(p);
         }
 
-        // State change: flush any pending draws first
-        flushCollapsedDraws();
-        if (drawsSinceLastStateChange > 0) {
-            LodPocMod::logAll(LogLevel::Info, "[GLTrace]   [{} draw calls in this state]", drawsSinceLastStateChange);
-            drawsSinceLastStateChange = 0;
+        LodPocMod::logAll(LogLevel::Info,
+                          "SEGMENT #{}: FBO {} | Viewport: [{}, {}, {}, {}] | Attachments: [{}]",
+                          seg.segmentIndex, seg.fboId, seg.vpX, seg.vpY, seg.vpW, seg.vpH, seg.attachmentSummary);
+        LodPocMod::logAll(LogLevel::Info,
+                          "  Draws: {} ({}) | SUM(count): {} | Instanced: {}",
+                          seg.totalDrawCalls, funcBreakdown, seg.sumVertexCount, seg.sumInstanceCount);
+        LodPocMod::logAll(LogLevel::Info,
+                          "  State: DepthTest={}, DepthMask={}, Blend={} | Distinct Programs: {} (IDs: [{}])",
+                          seg.depthTestEnabled ? "ON" : "OFF",
+                          seg.depthMaskEnabled ? "ON" : "OFF",
+                          seg.blendEnabled ? "ON" : "OFF",
+                          seg.distinctPrograms.size(), progsList);
+
+        if (mConfigTraceRaw && !seg.rawDraws.empty()) {
+            for (const auto &raw : seg.rawDraws) {
+                LodPocMod::logAll(LogLevel::Info,
+                                  "    [RawDraw #{}] {}(mode=0x{:x} [{}], first={}, count={}, type=0x{:x} [{}], indices=0x{:x}, inst={}, baseVert={})",
+                                  raw.callIndex, raw.functionName,
+                                  raw.mode, modeToString(raw.mode),
+                                  raw.first, raw.count,
+                                  raw.type, typeToString(raw.type),
+                                  raw.indicesOrOffset, raw.instanceCount, raw.baseVertex);
+            }
         }
 
-        switch (ev.type) {
-            case GlEventType::Clear: {
-                LodPocMod::logAll(LogLevel::Info,
-                                  "[GLTrace] glClear(mask=0x{:08x} [{}])",
-                                  ev.clear.mask, formatClearMask(ev.clear.mask));
-                if (ev.clear.mask & GL_DEPTH_BUFFER_BIT) {
-                    lastDepthClearDrawIndex = static_cast<int32_t>(ev.drawCallIndex);
-                    firstDrawAfterLastDepthClear = -1;
-                }
-                break;
-            }
-            case GlEventType::Viewport: {
-                LodPocMod::logAll(LogLevel::Info,
-                                  "[GLTrace] glViewport(x={}, y={}, w={}, h={})",
-                                  ev.viewport.x, ev.viewport.y, ev.viewport.w, ev.viewport.h);
-                break;
-            }
-            case GlEventType::Scissor: {
-                LodPocMod::logAll(LogLevel::Info,
-                                  "[GLTrace] glScissor(x={}, y={}, w={}, h={})",
-                                  ev.scissor.x, ev.scissor.y, ev.scissor.w, ev.scissor.h);
-                break;
-            }
-            case GlEventType::Enable: {
-                const char *name = capToString(ev.cap.cap);
-                if (name != nullptr) {
-                    LodPocMod::logAll(LogLevel::Info, "[GLTrace] glEnable(0x{:04x} [{}])", ev.cap.cap, name);
-                } else {
-                    LodPocMod::logAll(LogLevel::Info, "[GLTrace] glEnable(0x{:04x})", ev.cap.cap);
-                }
-                if (ev.cap.cap == 0x0B71 /* GL_DEPTH_TEST */) {
-                    depthTestOn = true;
-                }
-                break;
-            }
-            case GlEventType::Disable: {
-                const char *name = capToString(ev.cap.cap);
-                if (name != nullptr) {
-                    LodPocMod::logAll(LogLevel::Info, "[GLTrace] glDisable(0x{:04x} [{}])", ev.cap.cap, name);
-                } else {
-                    LodPocMod::logAll(LogLevel::Info, "[GLTrace] glDisable(0x{:04x})", ev.cap.cap);
-                }
-                if (ev.cap.cap == 0x0B71 /* GL_DEPTH_TEST */) {
-                    depthTestOn = false;
-                    if (maxRunDepthOn > 40 && uiStartCandidate < 0) {
-                        uiStartCandidate = static_cast<int32_t>(ev.drawCallIndex);
-                    }
-                    currentRunDepthOn = 0;
-                }
-                break;
-            }
-            case GlEventType::DepthMask: {
-                LodPocMod::logAll(LogLevel::Info, "[GLTrace] glDepthMask(flag={})", ev.depthMask.flag ? "GL_TRUE" : "GL_FALSE");
-                break;
-            }
-            case GlEventType::DepthFunc: {
-                LodPocMod::logAll(LogLevel::Info, "[GLTrace] glDepthFunc(func=0x{:04x})", ev.depthFunc.func);
-                break;
-            }
-            case GlEventType::BlendFunc: {
-                LodPocMod::logAll(LogLevel::Info, "[GLTrace] glBlendFunc(sfactor=0x{:04x}, dfactor=0x{:04x})",
-                                  ev.blendFunc.sfactor, ev.blendFunc.dfactor);
-                break;
-            }
-            case GlEventType::BlendFuncSeparate: {
-                LodPocMod::logAll(LogLevel::Info,
-                                  "[GLTrace] glBlendFuncSeparate(srcRGB=0x{:04x}, dstRGB=0x{:04x}, srcA=0x{:04x}, dstA=0x{:04x})",
-                                  ev.blendFuncSep.srgb, ev.blendFuncSep.drgb, ev.blendFuncSep.sa, ev.blendFuncSep.da);
-                break;
-            }
-            case GlEventType::CullFace: {
-                LodPocMod::logAll(LogLevel::Info, "[GLTrace] glCullFace(mode=0x{:04x})", ev.cullFace.mode);
-                break;
-            }
-            case GlEventType::UseProgram: {
-                LodPocMod::logAll(LogLevel::Info, "[GLTrace] glUseProgram(program={})", ev.useProgram.program);
-                break;
-            }
-            case GlEventType::BindFbo: {
-                LodPocMod::logAll(LogLevel::Info, "[GLTrace] glBindFramebuffer(target=0x{:04x}, fbo={})",
-                                  ev.bindFbo.target, ev.bindFbo.fbo);
-                break;
-            }
-            case GlEventType::FboTexture2D: {
-                LodPocMod::logAll(LogLevel::Info,
-                                  "[GLTrace] glFramebufferTexture2D(target=0x{:04x}, attachment=0x{:04x}, textarget=0x{:04x}, texture={}, level={})",
-                                  ev.fboTex2D.target, ev.fboTex2D.attachment, ev.fboTex2D.textarget, ev.fboTex2D.texture, ev.fboTex2D.level);
-                break;
-            }
-            case GlEventType::InvalidateFbo: {
-                LodPocMod::logAll(LogLevel::Info, "[GLTrace] glInvalidateFramebuffer(target=0x{:04x}, num={})",
-                                  ev.invalidateFbo.target, ev.invalidateFbo.num);
-                break;
-            }
-            case GlEventType::BlitFbo: {
-                LodPocMod::logAll(LogLevel::Info, "[GLTrace] glBlitFramebuffer(mask=0x{:08x}, filter=0x{:04x})",
-                                  ev.blitFbo.mask, ev.blitFbo.filter);
-                break;
-            }
-            default:
-                break;
+        if (seg.depthTestEnabled && seg.sumVertexCount > 0) {
+            depthCandidates.push_back({seg.segmentIndex, seg.fboId, seg.sumVertexCount, seg.distinctPrograms.size()});
         }
     }
 
-    flushCollapsedDraws();
+    std::sort(depthCandidates.begin(), depthCandidates.end(), [](const Candidate &a, const Candidate &b) {
+        return a.sumCount > b.sumCount;
+    });
 
-    LodPocMod::logAll(LogLevel::Info,
-                      "[Probe A: GLTrace] ===== FRAME TRACE SUMMARY ({}) =====",
-                      label);
-    LodPocMod::logAll(LogLevel::Info, "[Probe A: GLTrace] Total draw calls: {}", totalDrawCalls);
-    LodPocMod::logAll(LogLevel::Info, "[Probe A: GLTrace] Largest run of draws with depth test ON: {}", maxRunDepthOn);
-    LodPocMod::logAll(LogLevel::Info, "[Probe A: GLTrace] Index of first draw after last depth clear: {}", firstDrawAfterLastDepthClear);
-    LodPocMod::logAll(LogLevel::Info, "[Probe A: GLTrace] Index where depth test is first disabled after big run (UI start candidate): {}", uiStartCandidate);
-    LodPocMod::logAll(LogLevel::Info, "[Probe A: GLTrace] ===================================================");
+    if (!depthCandidates.empty()) {
+        const auto &top = depthCandidates.front();
+        LodPocMod::logAll(LogLevel::Info,
+                          ">>> TERRAIN CANDIDATE: Segment #{} (FBO {}) with SUM(count)={}, Programs={} <<<",
+                          top.segIndex, top.fboId, top.sumCount, top.distinctProgs);
+
+        LodPocMod::logAll(LogLevel::Info, "TOP 3 CANDIDATE SEGMENTS (DepthTest ON, highest vertex/index count):");
+        for (size_t k = 0; k < std::min<size_t>(3, depthCandidates.size()); ++k) {
+            const auto &c = depthCandidates[k];
+            LodPocMod::logAll(LogLevel::Info,
+                              "  {}. Segment #{}: FBO {} | SUM(count)={} | Programs={}",
+                              k + 1, c.segIndex, c.fboId, c.sumCount, c.distinctProgs);
+        }
+    } else {
+        LodPocMod::logAll(LogLevel::Info, "No segments found with DepthTest ON and draw calls > 0.");
+    }
+
+    LodPocMod::logAll(LogLevel::Info, "============================================================");
 }
 
 // -----------------------------------------------------------------------------
-// Hook Detour Implementations
+// State and Storage Handlers
 // -----------------------------------------------------------------------------
 
-#define DISPATCH_HOOK(NAME, ...)                                                               \
-    auto &inst = GlTrace::instance();                                                          \
-    if (inst.mOrig##NAME != nullptr) {                                                         \
-        inst.mOrig##NAME(__VA_ARGS__);                                                         \
-    }                                                                                          \
-    if (gettid() != inst.getRenderThreadId()) return;                                         \
-    if (inst.mState.load(std::memory_order_relaxed) != GlTrace::TraceState::Recording) return;
-
-void GlTrace::detourClear(GLbitfield mask) {
-    DISPATCH_HOOK(Clear, mask)
-    inst.recordClear(mask);
+void GlTrace::onBindFramebuffer(GLenum target, GLuint framebuffer) {
+    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
+        mCurrentBoundDrawFbo = framebuffer;
+    }
+    if (mState.load(std::memory_order_relaxed) == TraceState::Recording && gettid() == getRenderThreadId()) {
+        std::lock_guard lock(mFrameSegmentsMutex);
+        startNewSegment(framebuffer);
+    }
 }
 
-void GlTrace::detourViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
-    DISPATCH_HOOK(Viewport, x, y, width, height)
-    inst.recordViewport(x, y, width, height);
+void GlTrace::onBindTexture(GLenum target, GLuint texture) {
+    if (target == GL_TEXTURE_2D) {
+        mCurrentBoundTexture2D = texture;
+    }
 }
 
-void GlTrace::detourScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
-    DISPATCH_HOOK(Scissor, x, y, width, height)
-    inst.recordScissor(x, y, width, height);
+void GlTrace::onBindRenderbuffer(GLenum target, GLuint renderbuffer) {
+    if (target == GL_RENDERBUFFER) {
+        mCurrentBoundRenderbuffer = renderbuffer;
+    }
 }
 
-void GlTrace::detourEnable(GLenum cap) {
-    DISPATCH_HOOK(Enable, cap)
-    inst.recordEnable(cap);
+void GlTrace::onTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height) {
+    (void)level;
+    if (target == GL_TEXTURE_2D && mCurrentBoundTexture2D != 0) {
+        mTextureMap[mCurrentBoundTexture2D] = {mCurrentBoundTexture2D, width, height, static_cast<GLenum>(internalformat), true};
+    }
 }
 
-void GlTrace::detourDisable(GLenum cap) {
-    DISPATCH_HOOK(Disable, cap)
-    inst.recordDisable(cap);
+void GlTrace::onTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {
+    (void)levels;
+    if (target == GL_TEXTURE_2D && mCurrentBoundTexture2D != 0) {
+        mTextureMap[mCurrentBoundTexture2D] = {mCurrentBoundTexture2D, width, height, internalformat, true};
+    }
 }
 
-void GlTrace::detourDepthMask(GLboolean flag) {
-    DISPATCH_HOOK(DepthMask, flag)
-    inst.recordDepthMask(flag);
+void GlTrace::onRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) {
+    if (target == GL_RENDERBUFFER && mCurrentBoundRenderbuffer != 0) {
+        mRenderbufferMap[mCurrentBoundRenderbuffer] = {mCurrentBoundRenderbuffer, width, height, internalformat, false};
+    }
 }
 
-void GlTrace::detourDepthFunc(GLenum func) {
-    DISPATCH_HOOK(DepthFunc, func)
-    inst.recordDepthFunc(func);
+void GlTrace::onFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
+    (void)target; (void)textarget; (void)level;
+    GLuint fbo = mCurrentBoundDrawFbo;
+    if (fbo == 0) return;
+
+    ImageDesc desc = mTextureMap[texture];
+    desc.id = texture;
+    desc.isTexture = true;
+
+    if (attachment >= GL_COLOR_ATTACHMENT0 && attachment <= GL_COLOR_ATTACHMENT15) {
+        mFboMap[fbo].colors[attachment] = desc;
+    } else if (attachment == GL_DEPTH_ATTACHMENT || attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+        mFboMap[fbo].depth = desc;
+    } else if (attachment == GL_STENCIL_ATTACHMENT) {
+        mFboMap[fbo].stencil = desc;
+    }
 }
 
-void GlTrace::detourBlendFunc(GLenum sfactor, GLenum dfactor) {
-    DISPATCH_HOOK(BlendFunc, sfactor, dfactor)
-    inst.recordBlendFunc(sfactor, dfactor);
+void GlTrace::onFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {
+    (void)target; (void)level; (void)layer;
+    GLuint fbo = mCurrentBoundDrawFbo;
+    if (fbo == 0) return;
+
+    ImageDesc desc = mTextureMap[texture];
+    desc.id = texture;
+    desc.isTexture = true;
+
+    if (attachment >= GL_COLOR_ATTACHMENT0 && attachment <= GL_COLOR_ATTACHMENT15) {
+        mFboMap[fbo].colors[attachment] = desc;
+    } else if (attachment == GL_DEPTH_ATTACHMENT || attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+        mFboMap[fbo].depth = desc;
+    }
 }
 
-void GlTrace::detourBlendFuncSeparate(GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha) {
-    DISPATCH_HOOK(BlendFuncSeparate, srcRGB, dstRGB, srcAlpha, dstAlpha)
-    inst.recordBlendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha);
+void GlTrace::onFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
+    (void)target; (void)renderbuffertarget;
+    GLuint fbo = mCurrentBoundDrawFbo;
+    if (fbo == 0) return;
+
+    ImageDesc desc = mRenderbufferMap[renderbuffer];
+    desc.id = renderbuffer;
+    desc.isTexture = false;
+
+    if (attachment >= GL_COLOR_ATTACHMENT0 && attachment <= GL_COLOR_ATTACHMENT15) {
+        mFboMap[fbo].colors[attachment] = desc;
+    } else if (attachment == GL_DEPTH_ATTACHMENT || attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+        mFboMap[fbo].depth = desc;
+    } else if (attachment == GL_STENCIL_ATTACHMENT) {
+        mFboMap[fbo].stencil = desc;
+    }
 }
 
-void GlTrace::detourCullFace(GLenum mode) {
-    DISPATCH_HOOK(CullFace, mode)
-    inst.recordCullFace(mode);
+void GlTrace::onDrawBuffers(GLsizei n, const GLenum *bufs) {
+    (void)n; (void)bufs;
 }
 
-void GlTrace::detourUseProgram(GLuint program) {
-    DISPATCH_HOOK(UseProgram, program)
-    inst.recordUseProgram(program);
+void GlTrace::onViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+    mCurrentVpX = x;
+    mCurrentVpY = y;
+    mCurrentVpW = width;
+    mCurrentVpH = height;
+    if (mState.load(std::memory_order_relaxed) == TraceState::Recording && gettid() == getRenderThreadId()) {
+        std::lock_guard lock(mFrameSegmentsMutex);
+        if (!mCurrentFrameSegments.empty()) {
+            mCurrentFrameSegments.back().vpX = x;
+            mCurrentFrameSegments.back().vpY = y;
+            mCurrentFrameSegments.back().vpW = width;
+            mCurrentFrameSegments.back().vpH = height;
+        }
+    }
 }
+
+void GlTrace::onEnable(GLenum cap) {
+    if (cap == 0x0B71 /* GL_DEPTH_TEST */) mCurrentDepthTest = true;
+    else if (cap == 0x0BE2 /* GL_BLEND */) mCurrentBlend = true;
+}
+
+void GlTrace::onDisable(GLenum cap) {
+    if (cap == 0x0B71 /* GL_DEPTH_TEST */) mCurrentDepthTest = false;
+    else if (cap == 0x0BE2 /* GL_BLEND */) mCurrentBlend = false;
+}
+
+void GlTrace::onDepthMask(GLboolean flag) {
+    mCurrentDepthMask = (flag != GL_FALSE);
+}
+
+void GlTrace::onUseProgram(GLuint program) {
+    mCurrentProgram = program;
+}
+
+// -----------------------------------------------------------------------------
+// Detour Implementations
+// -----------------------------------------------------------------------------
 
 void GlTrace::detourBindFramebuffer(GLenum target, GLuint framebuffer) {
     auto &inst = GlTrace::instance();
@@ -406,318 +459,404 @@ void GlTrace::detourBindFramebuffer(GLenum target, GLuint framebuffer) {
         inst.mOrigBindFramebuffer(target, framebuffer);
     }
     LodPocMod::instance().onBindFramebuffer(target, framebuffer);
-    if (gettid() != inst.getRenderThreadId()) return;
-    if (inst.mState.load(std::memory_order_relaxed) != GlTrace::TraceState::Recording) return;
-    inst.recordBindFbo(target, framebuffer);
+    inst.onBindFramebuffer(target, framebuffer);
+}
+
+void GlTrace::detourBindTexture(GLenum target, GLuint texture) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigBindTexture != nullptr) inst.mOrigBindTexture(target, texture);
+    inst.onBindTexture(target, texture);
+}
+
+void GlTrace::detourBindRenderbuffer(GLenum target, GLuint renderbuffer) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigBindRenderbuffer != nullptr) inst.mOrigBindRenderbuffer(target, renderbuffer);
+    inst.onBindRenderbuffer(target, renderbuffer);
+}
+
+void GlTrace::detourTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigTexImage2D != nullptr) inst.mOrigTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    inst.onTexImage2D(target, level, internalformat, width, height);
+}
+
+void GlTrace::detourTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigTexStorage2D != nullptr) inst.mOrigTexStorage2D(target, levels, internalformat, width, height);
+    inst.onTexStorage2D(target, levels, internalformat, width, height);
+}
+
+void GlTrace::detourRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigRenderbufferStorage != nullptr) inst.mOrigRenderbufferStorage(target, internalformat, width, height);
+    inst.onRenderbufferStorage(target, internalformat, width, height);
 }
 
 void GlTrace::detourFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
-    DISPATCH_HOOK(FramebufferTexture2D, target, attachment, textarget, texture, level)
-    inst.recordFboTexture2D(target, attachment, textarget, texture, level);
-}
-
-void GlTrace::detourInvalidateFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments) {
-    DISPATCH_HOOK(InvalidateFramebuffer, target, numAttachments, attachments)
-    inst.recordInvalidateFbo(target, numAttachments, attachments);
-}
-
-void GlTrace::detourBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
-                                    GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
-                                    GLbitfield mask, GLenum filter) {
-    DISPATCH_HOOK(BlitFramebuffer, srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter)
-    inst.recordBlitFbo(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
-}
-
-void GlTrace::detourDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
     auto &inst = GlTrace::instance();
-    if (inst.mOrigDrawElements != nullptr) {
-        inst.mOrigDrawElements(mode, count, type, indices);
-    }
-    inst.mDrawElementsCount.fetch_add(1, std::memory_order_relaxed);
-    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
-    if (gettid() != inst.getRenderThreadId()) return;
-    if (inst.mState.load(std::memory_order_relaxed) != GlTrace::TraceState::Recording) return;
-    inst.recordDrawElements(mode, count, type);
+    if (inst.mOrigFramebufferTexture2D != nullptr) inst.mOrigFramebufferTexture2D(target, attachment, textarget, texture, level);
+    inst.onFramebufferTexture2D(target, attachment, textarget, texture, level);
+}
+
+void GlTrace::detourFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigFramebufferTextureLayer != nullptr) inst.mOrigFramebufferTextureLayer(target, attachment, texture, level, layer);
+    inst.onFramebufferTextureLayer(target, attachment, texture, level, layer);
+}
+
+void GlTrace::detourFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigFramebufferRenderbuffer != nullptr) inst.mOrigFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+    inst.onFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+}
+
+void GlTrace::detourDrawBuffers(GLsizei n, const GLenum *bufs) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDrawBuffers != nullptr) inst.mOrigDrawBuffers(n, bufs);
+    inst.onDrawBuffers(n, bufs);
+}
+
+void GlTrace::detourViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigViewport != nullptr) inst.mOrigViewport(x, y, width, height);
+    inst.onViewport(x, y, width, height);
+}
+
+void GlTrace::detourEnable(GLenum cap) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigEnable != nullptr) inst.mOrigEnable(cap);
+    inst.onEnable(cap);
+}
+
+void GlTrace::detourDisable(GLenum cap) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDisable != nullptr) inst.mOrigDisable(cap);
+    inst.onDisable(cap);
+}
+
+void GlTrace::detourDepthMask(GLboolean flag) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDepthMask != nullptr) inst.mOrigDepthMask(flag);
+    inst.onDepthMask(flag);
+}
+
+void GlTrace::detourUseProgram(GLuint program) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigUseProgram != nullptr) inst.mOrigUseProgram(program);
+    inst.onUseProgram(program);
 }
 
 void GlTrace::detourDrawArrays(GLenum mode, GLint first, GLsizei count) {
     auto &inst = GlTrace::instance();
-    if (inst.mOrigDrawArrays != nullptr) {
-        inst.mOrigDrawArrays(mode, first, count);
-    }
-    inst.mDrawArraysCount.fetch_add(1, std::memory_order_relaxed);
-    if (gettid() != inst.getRenderThreadId()) return;
-    if (inst.mState.load(std::memory_order_relaxed) != GlTrace::TraceState::Recording) return;
-    inst.recordDrawArrays(mode, first, count);
-}
-
-void GlTrace::detourDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) {
-    auto &inst = GlTrace::instance();
-    if (inst.mOrigDrawElementsInstanced != nullptr) {
-        inst.mOrigDrawElementsInstanced(mode, count, type, indices, instancecount);
-    }
-    inst.mDrawElementsCount.fetch_add(1, std::memory_order_relaxed);
-    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
-    if (gettid() != inst.getRenderThreadId()) return;
-    if (inst.mState.load(std::memory_order_relaxed) != GlTrace::TraceState::Recording) return;
-    inst.recordDrawElementsInstanced(mode, count, instancecount);
+    if (inst.mOrigDrawArrays != nullptr) inst.mOrigDrawArrays(mode, first, count);
+    RawDrawRecord rec;
+    rec.functionName = "glDrawArrays";
+    rec.mode = mode;
+    rec.first = first;
+    rec.count = count;
+    rec.instanceCount = 1;
+    inst.onDraw(rec);
 }
 
 void GlTrace::detourDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
     auto &inst = GlTrace::instance();
-    if (inst.mOrigDrawArraysInstanced != nullptr) {
-        inst.mOrigDrawArraysInstanced(mode, first, count, instancecount);
+    if (inst.mOrigDrawArraysInstanced != nullptr) inst.mOrigDrawArraysInstanced(mode, first, count, instancecount);
+    RawDrawRecord rec;
+    rec.functionName = "glDrawArraysInstanced";
+    rec.mode = mode;
+    rec.first = first;
+    rec.count = count;
+    rec.instanceCount = instancecount;
+    inst.onDraw(rec);
+}
+
+void GlTrace::detourDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDrawElements != nullptr) inst.mOrigDrawElements(mode, count, type, indices);
+    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
+    RawDrawRecord rec;
+    rec.functionName = "glDrawElements";
+    rec.mode = mode;
+    rec.count = count;
+    rec.type = type;
+    rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indices);
+    rec.instanceCount = 1;
+    inst.onDraw(rec);
+}
+
+void GlTrace::detourDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDrawElementsInstanced != nullptr) inst.mOrigDrawElementsInstanced(mode, count, type, indices, instancecount);
+    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
+    RawDrawRecord rec;
+    rec.functionName = "glDrawElementsInstanced";
+    rec.mode = mode;
+    rec.count = count;
+    rec.type = type;
+    rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indices);
+    rec.instanceCount = instancecount;
+    inst.onDraw(rec);
+}
+
+void GlTrace::detourDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDrawRangeElements != nullptr) inst.mOrigDrawRangeElements(mode, start, end, count, type, indices);
+    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
+    RawDrawRecord rec;
+    rec.functionName = "glDrawRangeElements";
+    rec.mode = mode;
+    rec.start = start;
+    rec.end = end;
+    rec.count = count;
+    rec.type = type;
+    rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indices);
+    rec.instanceCount = 1;
+    inst.onDraw(rec);
+}
+
+void GlTrace::detourDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLint basevertex) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDrawElementsBaseVertex != nullptr) inst.mOrigDrawElementsBaseVertex(mode, count, type, indices, basevertex);
+    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
+    RawDrawRecord rec;
+    rec.functionName = "glDrawElementsBaseVertex";
+    rec.mode = mode;
+    rec.count = count;
+    rec.type = type;
+    rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indices);
+    rec.baseVertex = basevertex;
+    rec.instanceCount = 1;
+    inst.onDraw(rec);
+}
+
+void GlTrace::detourDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount, GLint basevertex) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDrawElementsInstancedBaseVertex != nullptr) inst.mOrigDrawElementsInstancedBaseVertex(mode, count, type, indices, instancecount, basevertex);
+    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
+    RawDrawRecord rec;
+    rec.functionName = "glDrawElementsInstancedBaseVertex";
+    rec.mode = mode;
+    rec.count = count;
+    rec.type = type;
+    rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indices);
+    rec.instanceCount = instancecount;
+    rec.baseVertex = basevertex;
+    inst.onDraw(rec);
+}
+
+void GlTrace::detourDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices, GLint basevertex) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDrawRangeElementsBaseVertex != nullptr) inst.mOrigDrawRangeElementsBaseVertex(mode, start, end, count, type, indices, basevertex);
+    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
+    RawDrawRecord rec;
+    rec.functionName = "glDrawRangeElementsBaseVertex";
+    rec.mode = mode;
+    rec.start = start;
+    rec.end = end;
+    rec.count = count;
+    rec.type = type;
+    rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indices);
+    rec.baseVertex = basevertex;
+    rec.instanceCount = 1;
+    inst.onDraw(rec);
+}
+
+void GlTrace::detourDrawArraysIndirect(GLenum mode, const void *indirect) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDrawArraysIndirect != nullptr) inst.mOrigDrawArraysIndirect(mode, indirect);
+    RawDrawRecord rec;
+    rec.functionName = "glDrawArraysIndirect";
+    rec.mode = mode;
+    rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indirect);
+    inst.onDraw(rec);
+}
+
+void GlTrace::detourDrawElementsIndirect(GLenum mode, GLenum type, const void *indirect) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigDrawElementsIndirect != nullptr) inst.mOrigDrawElementsIndirect(mode, type, indirect);
+    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
+    RawDrawRecord rec;
+    rec.functionName = "glDrawElementsIndirect";
+    rec.mode = mode;
+    rec.type = type;
+    rec.indicesOrOffset = reinterpret_cast<uintptr_t>(indirect);
+    inst.onDraw(rec);
+}
+
+void GlTrace::detourMultiDrawArraysEXT(GLenum mode, const GLint *first, const GLsizei *count, GLsizei primcount) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigMultiDrawArraysEXT != nullptr) inst.mOrigMultiDrawArraysEXT(mode, first, count, primcount);
+    RawDrawRecord rec;
+    rec.functionName = "glMultiDrawArraysEXT";
+    rec.mode = mode;
+    rec.primCount = primcount;
+    rec.instanceCount = 1;
+    if (count != nullptr) {
+        GLsizei sum = 0;
+        for (GLsizei i = 0; i < primcount; ++i) sum += count[i];
+        rec.count = sum;
     }
-    inst.mDrawArraysCount.fetch_add(1, std::memory_order_relaxed);
-    if (gettid() != inst.getRenderThreadId()) return;
-    if (inst.mState.load(std::memory_order_relaxed) != GlTrace::TraceState::Recording) return;
-    inst.recordDrawArraysInstanced(mode, first, count, instancecount);
+    inst.onDraw(rec);
+}
+
+void GlTrace::detourMultiDrawElementsEXT(GLenum mode, const GLsizei *count, GLenum type, const void *const *indices, GLsizei primcount) {
+    auto &inst = GlTrace::instance();
+    if (inst.mOrigMultiDrawElementsEXT != nullptr) inst.mOrigMultiDrawElementsEXT(mode, count, type, indices, primcount);
+    inst.mFrameDrawElements.fetch_add(1, std::memory_order_relaxed);
+    RawDrawRecord rec;
+    rec.functionName = "glMultiDrawElementsEXT";
+    rec.mode = mode;
+    rec.type = type;
+    rec.primCount = primcount;
+    rec.instanceCount = 1;
+    if (count != nullptr) {
+        GLsizei sum = 0;
+        for (GLsizei i = 0; i < primcount; ++i) sum += count[i];
+        rec.count = sum;
+    }
+    inst.onDraw(rec);
 }
 
 // -----------------------------------------------------------------------------
-// Event recording methods
-// -----------------------------------------------------------------------------
-
-void GlTrace::recordClear(GLbitfield mask) {
-    GlEvent ev;
-    ev.type = GlEventType::Clear;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.clear.mask = mask;
-    recordEvent(ev);
-}
-
-void GlTrace::recordViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
-    GlEvent ev;
-    ev.type = GlEventType::Viewport;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.viewport = {x, y, w, h};
-    recordEvent(ev);
-}
-
-void GlTrace::recordScissor(GLint x, GLint y, GLsizei w, GLsizei h) {
-    GlEvent ev;
-    ev.type = GlEventType::Scissor;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.scissor = {x, y, w, h};
-    recordEvent(ev);
-}
-
-void GlTrace::recordEnable(GLenum cap) {
-    GlEvent ev;
-    ev.type = GlEventType::Enable;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.cap.cap = cap;
-    recordEvent(ev);
-}
-
-void GlTrace::recordDisable(GLenum cap) {
-    GlEvent ev;
-    ev.type = GlEventType::Disable;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.cap.cap = cap;
-    recordEvent(ev);
-}
-
-void GlTrace::recordDepthMask(GLboolean flag) {
-    GlEvent ev;
-    ev.type = GlEventType::DepthMask;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.depthMask.flag = flag;
-    recordEvent(ev);
-}
-
-void GlTrace::recordDepthFunc(GLenum func) {
-    GlEvent ev;
-    ev.type = GlEventType::DepthFunc;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.depthFunc.func = func;
-    recordEvent(ev);
-}
-
-void GlTrace::recordBlendFunc(GLenum sfactor, GLenum dfactor) {
-    GlEvent ev;
-    ev.type = GlEventType::BlendFunc;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.blendFunc = {sfactor, dfactor};
-    recordEvent(ev);
-}
-
-void GlTrace::recordBlendFuncSeparate(GLenum srgb, GLenum drgb, GLenum sa, GLenum da) {
-    GlEvent ev;
-    ev.type = GlEventType::BlendFuncSeparate;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.blendFuncSep = {srgb, drgb, sa, da};
-    recordEvent(ev);
-}
-
-void GlTrace::recordCullFace(GLenum mode) {
-    GlEvent ev;
-    ev.type = GlEventType::CullFace;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.cullFace.mode = mode;
-    recordEvent(ev);
-}
-
-void GlTrace::recordUseProgram(GLuint program) {
-    GlEvent ev;
-    ev.type = GlEventType::UseProgram;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.useProgram.program = program;
-    recordEvent(ev);
-}
-
-void GlTrace::recordBindFbo(GLenum target, GLuint fbo) {
-    GlEvent ev;
-    ev.type = GlEventType::BindFbo;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.bindFbo = {target, fbo};
-    recordEvent(ev);
-}
-
-void GlTrace::recordFboTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
-    GlEvent ev;
-    ev.type = GlEventType::FboTexture2D;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.fboTex2D = {target, attachment, textarget, texture, level};
-    recordEvent(ev);
-}
-
-void GlTrace::recordInvalidateFbo(GLenum target, GLsizei numAttachments, const GLenum *attachments) {
-    (void)attachments;
-    GlEvent ev;
-    ev.type = GlEventType::InvalidateFbo;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.invalidateFbo = {target, numAttachments};
-    recordEvent(ev);
-}
-
-void GlTrace::recordBlitFbo(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
-                            GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
-                            GLbitfield mask, GLenum filter) {
-    (void)srcX0; (void)srcY0; (void)srcX1; (void)srcY1;
-    (void)dstX0; (void)dstY0; (void)dstX1; (void)dstY1;
-    GlEvent ev;
-    ev.type = GlEventType::BlitFbo;
-    ev.drawCallIndex = mRunningDrawIndex.load(std::memory_order_relaxed);
-    ev.blitFbo = {mask, filter};
-    recordEvent(ev);
-}
-
-void GlTrace::recordDrawElements(GLenum mode, GLsizei count, GLenum type) {
-    uint32_t drawIdx = mRunningDrawIndex.fetch_add(1, std::memory_order_relaxed);
-    GlEvent ev;
-    ev.type = GlEventType::DrawElements;
-    ev.drawCallIndex = drawIdx;
-    ev.drawElements = {mode, count, type};
-    recordEvent(ev);
-}
-
-void GlTrace::recordDrawArrays(GLenum mode, GLint first, GLsizei count) {
-    uint32_t drawIdx = mRunningDrawIndex.fetch_add(1, std::memory_order_relaxed);
-    GlEvent ev;
-    ev.type = GlEventType::DrawArrays;
-    ev.drawCallIndex = drawIdx;
-    ev.drawArrays = {mode, first, count};
-    recordEvent(ev);
-}
-
-void GlTrace::recordDrawElementsInstanced(GLenum mode, GLsizei count, GLsizei instanceCount) {
-    uint32_t drawIdx = mRunningDrawIndex.fetch_add(1, std::memory_order_relaxed);
-    GlEvent ev;
-    ev.type = GlEventType::DrawElementsInstanced;
-    ev.drawCallIndex = drawIdx;
-    ev.drawInstanced = {mode, count, instanceCount};
-    recordEvent(ev);
-}
-
-void GlTrace::recordDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instanceCount) {
-    (void)first;
-    uint32_t drawIdx = mRunningDrawIndex.fetch_add(1, std::memory_order_relaxed);
-    GlEvent ev;
-    ev.type = GlEventType::DrawArraysInstanced;
-    ev.drawCallIndex = drawIdx;
-    ev.drawInstanced = {mode, count, instanceCount};
-    recordEvent(ev);
-}
-
-// -----------------------------------------------------------------------------
-// Hook Installation / Removal
+// Lifecycle & Hook Installation
 // -----------------------------------------------------------------------------
 
 void GlTrace::install() {
     remove();
 
     void *glesLib = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!glesLib) {
-        glesLib = dlopen("libGLESv3.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!glesLib) glesLib = dlopen("libGLESv3.so", RTLD_NOW | RTLD_GLOBAL);
+
+    void *target = glesLib ? dlsym(glesLib, "glBindFramebuffer") : nullptr;
+    if (!target) target = dlsym(RTLD_DEFAULT, "glBindFramebuffer");
+
+    if (target != nullptr) {
+        pl::memory::HookHandle handle(target,
+                                      reinterpret_cast<void *>(&detourBindFramebuffer),
+                                      reinterpret_cast<void **>(&mOrigBindFramebuffer));
+        if (handle.installed()) {
+            mPermanentHooks.push_back(std::move(handle));
+            LodPocMod::logAll(LogLevel::Info, "[GLTrace] Permanent glBindFramebuffer hooked at {:p}", target);
+        }
     }
 
-    auto hookFn = [this, glesLib](const char *name, void *detour, void **orig) {
+    installHeavyHooks();
+}
+
+void GlTrace::remove() {
+    removeHeavyHooks();
+    mPermanentHooks.clear();
+    mOrigBindFramebuffer = nullptr;
+}
+
+void GlTrace::installHeavyHooks() {
+    if (mHeavyHooksInstalled) return;
+
+    void *glesLib = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!glesLib) glesLib = dlopen("libGLESv3.so", RTLD_NOW | RTLD_GLOBAL);
+
+    auto hookFn = [this, glesLib](const char *primaryName, const std::vector<const char *> &alts, void *detour, void **orig) {
         void *target = nullptr;
-        if (glesLib != nullptr) {
-            target = dlsym(glesLib, name);
+        std::string foundName;
+
+        std::vector<const char *> candidates;
+        candidates.push_back(primaryName);
+        for (const auto *a : alts) candidates.push_back(a);
+
+        for (const auto *cand : candidates) {
+            if (glesLib) target = dlsym(glesLib, cand);
+            if (!target) target = dlsym(RTLD_DEFAULT, cand);
+            if (target) {
+                foundName = cand;
+                break;
+            }
         }
+
         if (target == nullptr) {
-            target = dlsym(RTLD_DEFAULT, name);
-        }
-        if (target == nullptr) {
-            LodPocMod::logAll(LogLevel::Warn, "[Probe A: GLTrace] {} NOT FOUND", name);
+            LodPocMod::logAll(LogLevel::Info, "[GLTrace] Function '{}' not present in GLES driver.", primaryName);
             return;
         }
 
         pl::memory::HookHandle handle(target, detour, orig);
         if (!handle.installed()) {
-            LodPocMod::logAll(LogLevel::Error, "[Probe A: GLTrace] {} FAILED at {:p}", name, target);
+            LodPocMod::logAll(LogLevel::Warn, "[GLTrace] Failed to hook '{}' at {:p}", foundName, target);
         } else {
-            mHooks.push_back(std::move(handle));
+            mHeavyHooks.push_back(std::move(handle));
+            LodPocMod::logAll(LogLevel::Info, "[GLTrace] Hooked '{}' at {:p}", foundName, target);
         }
     };
 
-    hookFn("glClear", reinterpret_cast<void *>(&detourClear), reinterpret_cast<void **>(&mOrigClear));
-    hookFn("glViewport", reinterpret_cast<void *>(&detourViewport), reinterpret_cast<void **>(&mOrigViewport));
-    hookFn("glScissor", reinterpret_cast<void *>(&detourScissor), reinterpret_cast<void **>(&mOrigScissor));
-    hookFn("glEnable", reinterpret_cast<void *>(&detourEnable), reinterpret_cast<void **>(&mOrigEnable));
-    hookFn("glDisable", reinterpret_cast<void *>(&detourDisable), reinterpret_cast<void **>(&mOrigDisable));
-    hookFn("glDepthMask", reinterpret_cast<void *>(&detourDepthMask), reinterpret_cast<void **>(&mOrigDepthMask));
-    hookFn("glDepthFunc", reinterpret_cast<void *>(&detourDepthFunc), reinterpret_cast<void **>(&mOrigDepthFunc));
-    hookFn("glBlendFunc", reinterpret_cast<void *>(&detourBlendFunc), reinterpret_cast<void **>(&mOrigBlendFunc));
-    hookFn("glBlendFuncSeparate", reinterpret_cast<void *>(&detourBlendFuncSeparate), reinterpret_cast<void **>(&mOrigBlendFuncSeparate));
-    hookFn("glCullFace", reinterpret_cast<void *>(&detourCullFace), reinterpret_cast<void **>(&mOrigCullFace));
-    hookFn("glUseProgram", reinterpret_cast<void *>(&detourUseProgram), reinterpret_cast<void **>(&mOrigUseProgram));
-    hookFn("glBindFramebuffer", reinterpret_cast<void *>(&detourBindFramebuffer), reinterpret_cast<void **>(&mOrigBindFramebuffer));
-    hookFn("glFramebufferTexture2D", reinterpret_cast<void *>(&detourFramebufferTexture2D), reinterpret_cast<void **>(&mOrigFramebufferTexture2D));
-    hookFn("glInvalidateFramebuffer", reinterpret_cast<void *>(&detourInvalidateFramebuffer), reinterpret_cast<void **>(&mOrigInvalidateFramebuffer));
-    hookFn("glBlitFramebuffer", reinterpret_cast<void *>(&detourBlitFramebuffer), reinterpret_cast<void **>(&mOrigBlitFramebuffer));
-    hookFn("glDrawElements", reinterpret_cast<void *>(&detourDrawElements), reinterpret_cast<void **>(&mOrigDrawElements));
-    hookFn("glDrawArrays", reinterpret_cast<void *>(&detourDrawArrays), reinterpret_cast<void **>(&mOrigDrawArrays));
-    hookFn("glDrawElementsInstanced", reinterpret_cast<void *>(&detourDrawElementsInstanced), reinterpret_cast<void **>(&mOrigDrawElementsInstanced));
-    hookFn("glDrawArraysInstanced", reinterpret_cast<void *>(&detourDrawArraysInstanced), reinterpret_cast<void **>(&mOrigDrawArraysInstanced));
+    // Draw Hooks
+    hookFn("glDrawArrays", {}, reinterpret_cast<void *>(&detourDrawArrays), reinterpret_cast<void **>(&mOrigDrawArrays));
+    hookFn("glDrawArraysInstanced", {"glDrawArraysInstancedEXT", "glDrawArraysInstancedOES"}, reinterpret_cast<void *>(&detourDrawArraysInstanced), reinterpret_cast<void **>(&mOrigDrawArraysInstanced));
+    hookFn("glDrawElements", {}, reinterpret_cast<void *>(&detourDrawElements), reinterpret_cast<void **>(&mOrigDrawElements));
+    hookFn("glDrawElementsInstanced", {"glDrawElementsInstancedEXT", "glDrawElementsInstancedOES"}, reinterpret_cast<void *>(&detourDrawElementsInstanced), reinterpret_cast<void **>(&mOrigDrawElementsInstanced));
+    hookFn("glDrawRangeElements", {"glDrawRangeElementsEXT", "glDrawRangeElementsOES"}, reinterpret_cast<void *>(&detourDrawRangeElements), reinterpret_cast<void **>(&mOrigDrawRangeElements));
+    hookFn("glDrawElementsBaseVertex", {"glDrawElementsBaseVertexOES", "glDrawElementsBaseVertexEXT"}, reinterpret_cast<void *>(&detourDrawElementsBaseVertex), reinterpret_cast<void **>(&mOrigDrawElementsBaseVertex));
+    hookFn("glDrawElementsInstancedBaseVertex", {"glDrawElementsInstancedBaseVertexOES", "glDrawElementsInstancedBaseVertexEXT"}, reinterpret_cast<void *>(&detourDrawElementsInstancedBaseVertex), reinterpret_cast<void **>(&mOrigDrawElementsInstancedBaseVertex));
+    hookFn("glDrawRangeElementsBaseVertex", {"glDrawRangeElementsBaseVertexOES", "glDrawRangeElementsBaseVertexEXT"}, reinterpret_cast<void *>(&detourDrawRangeElementsBaseVertex), reinterpret_cast<void **>(&mOrigDrawRangeElementsBaseVertex));
+    hookFn("glDrawArraysIndirect", {}, reinterpret_cast<void *>(&detourDrawArraysIndirect), reinterpret_cast<void **>(&mOrigDrawArraysIndirect));
+    hookFn("glDrawElementsIndirect", {}, reinterpret_cast<void *>(&detourDrawElementsIndirect), reinterpret_cast<void **>(&mOrigDrawElementsIndirect));
+    hookFn("glMultiDrawArraysEXT", {}, reinterpret_cast<void *>(&detourMultiDrawArraysEXT), reinterpret_cast<void **>(&mOrigMultiDrawArraysEXT));
+    hookFn("glMultiDrawElementsEXT", {}, reinterpret_cast<void *>(&detourMultiDrawElementsEXT), reinterpret_cast<void **>(&mOrigMultiDrawElementsEXT));
 
-    LodPocMod::logAll(LogLevel::Info, "[Probe A: GLTrace] Installed {} GL hooks successfully", mHooks.size());
+    // State & Texture Tracking Hooks
+    hookFn("glBindTexture", {}, reinterpret_cast<void *>(&detourBindTexture), reinterpret_cast<void **>(&mOrigBindTexture));
+    hookFn("glBindRenderbuffer", {}, reinterpret_cast<void *>(&detourBindRenderbuffer), reinterpret_cast<void **>(&mOrigBindRenderbuffer));
+    hookFn("glTexImage2D", {}, reinterpret_cast<void *>(&detourTexImage2D), reinterpret_cast<void **>(&mOrigTexImage2D));
+    hookFn("glTexStorage2D", {"glTexStorage2DEXT"}, reinterpret_cast<void *>(&detourTexStorage2D), reinterpret_cast<void **>(&mOrigTexStorage2D));
+    hookFn("glRenderbufferStorage", {}, reinterpret_cast<void *>(&detourRenderbufferStorage), reinterpret_cast<void **>(&mOrigRenderbufferStorage));
+    hookFn("glFramebufferTexture2D", {}, reinterpret_cast<void *>(&detourFramebufferTexture2D), reinterpret_cast<void **>(&mOrigFramebufferTexture2D));
+    hookFn("glFramebufferTextureLayer", {}, reinterpret_cast<void *>(&detourFramebufferTextureLayer), reinterpret_cast<void **>(&mOrigFramebufferTextureLayer));
+    hookFn("glFramebufferRenderbuffer", {}, reinterpret_cast<void *>(&detourFramebufferRenderbuffer), reinterpret_cast<void **>(&mOrigFramebufferRenderbuffer));
+    hookFn("glDrawBuffers", {"glDrawBuffersEXT", "glDrawBuffersNV"}, reinterpret_cast<void *>(&detourDrawBuffers), reinterpret_cast<void **>(&mOrigDrawBuffers));
+
+    hookFn("glViewport", {}, reinterpret_cast<void *>(&detourViewport), reinterpret_cast<void **>(&mOrigViewport));
+    hookFn("glEnable", {}, reinterpret_cast<void *>(&detourEnable), reinterpret_cast<void **>(&mOrigEnable));
+    hookFn("glDisable", {}, reinterpret_cast<void *>(&detourDisable), reinterpret_cast<void **>(&mOrigDisable));
+    hookFn("glDepthMask", {}, reinterpret_cast<void *>(&detourDepthMask), reinterpret_cast<void **>(&mOrigDepthMask));
+    hookFn("glUseProgram", {}, reinterpret_cast<void *>(&detourUseProgram), reinterpret_cast<void **>(&mOrigUseProgram));
+
+    mHeavyHooksInstalled = true;
+    LodPocMod::logAll(LogLevel::Info, "[GLTrace] Installed {} heavy GL trace hooks", mHeavyHooks.size());
 }
 
-void GlTrace::remove() {
-    mHooks.clear();
+void GlTrace::removeHeavyHooks() {
+    if (!mHeavyHooksInstalled) return;
 
-    mOrigClear = nullptr;
+    mHeavyHooks.clear();
+
+    mOrigBindTexture = nullptr;
+    mOrigBindRenderbuffer = nullptr;
+    mOrigTexImage2D = nullptr;
+    mOrigTexStorage2D = nullptr;
+    mOrigRenderbufferStorage = nullptr;
+    mOrigFramebufferTexture2D = nullptr;
+    mOrigFramebufferTextureLayer = nullptr;
+    mOrigFramebufferRenderbuffer = nullptr;
+    mOrigDrawBuffers = nullptr;
+
     mOrigViewport = nullptr;
-    mOrigScissor = nullptr;
     mOrigEnable = nullptr;
     mOrigDisable = nullptr;
     mOrigDepthMask = nullptr;
-    mOrigDepthFunc = nullptr;
-    mOrigBlendFunc = nullptr;
-    mOrigBlendFuncSeparate = nullptr;
-    mOrigCullFace = nullptr;
     mOrigUseProgram = nullptr;
-    mOrigBindFramebuffer = nullptr;
-    mOrigFramebufferTexture2D = nullptr;
-    mOrigInvalidateFramebuffer = nullptr;
-    mOrigBlitFramebuffer = nullptr;
-    mOrigDrawElements = nullptr;
+
     mOrigDrawArrays = nullptr;
-    mOrigDrawElementsInstanced = nullptr;
     mOrigDrawArraysInstanced = nullptr;
+    mOrigDrawElements = nullptr;
+    mOrigDrawElementsInstanced = nullptr;
+    mOrigDrawRangeElements = nullptr;
+    mOrigDrawElementsBaseVertex = nullptr;
+    mOrigDrawElementsInstancedBaseVertex = nullptr;
+    mOrigDrawRangeElementsBaseVertex = nullptr;
+    mOrigDrawArraysIndirect = nullptr;
+    mOrigDrawElementsIndirect = nullptr;
+    mOrigMultiDrawArraysEXT = nullptr;
+    mOrigMultiDrawElementsEXT = nullptr;
+
+    mHeavyHooksInstalled = false;
+    LodPocMod::logAll(LogLevel::Info, "[GLTrace] Heavy GL trace hooks successfully uninstalled");
 }
 
 } // namespace lod_poc

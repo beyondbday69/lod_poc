@@ -71,22 +71,56 @@ This repository implements **log-only, non-intrusive diagnostic probes** designe
 
 ---
 
+## Configuration (`config.json`)
+
+Stored in `<mod_config_dir>/config.json` (or `<mod_data_dir>/config.json`):
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `traceFrame` | boolean | `true` | Enables single-frame GL trace. Traces `main_menu` and `in_world` automatically once. |
+| `traceRaw` | boolean | `false` | When `false`, writes only the compact pass segment summary (~20 lines). When `true`, also dumps raw arguments for every draw call. |
+| `traceLabel` | string | `""` | User label for manual re-arming (e.g. set to `"inventory"` or `"paused"` to capture a specific state). |
+| `probeCameraDiff` | boolean | `true` | Enables Probe B 3-snapshot memory diffing on `cullPointOrChunk`. |
+| `userNote` | string | `""` | Free-form notes with your recorded player coordinates at T1/T2/T3. |
+| `buildLodMap` | boolean | `true` | Enables background LevelDB scan and generation of `lod_map.png`. |
+| `probe_chunk_lighting` | boolean | `true` | Enables Probe 1 `ChunkSource::_lightingTask` hook. |
+| `probe_bind_framebuffer` | boolean | `true` | Enables Probe 2 FBO tracking. |
+| `probe_egl_swap_buffers` | boolean | `true` | Enables Probe 3 FPS and frame swap tracking. |
+| `probe_level_renderer_cull` | boolean | `true` | Enables Probe 5 `LevelRendererCamera::cullPointOrChunk` hook. |
+
+---
+
 ## What Lines to Send
 
-Open `/storage/emulated/0/Download/lod_poc.log` (or retrieve via ADB) and look for:
+Open `/storage/emulated/0/Download/lod_poc.log` (or retrieve via ADB) and send the following blocks:
 
-1. **Probe A (GL Frame Trace)**:
+1. **Build-ID & GL Context**:
    ```text
-   [Probe A: GLTrace] ==================== FRAME TRACE: in_world ====================
-   ...
-   [Probe A: GLTrace] ===== FRAME TRACE SUMMARY (in_world) =====
-   [Probe A: GLTrace] Total draw calls: ...
-   [Probe A: GLTrace] Largest run of draws with depth test ON: ...
-   [Probe A: GLTrace] Index of first draw after last depth clear: ...
-   [Probe A: GLTrace] Index where depth test is first disabled after big run: ...
+   [Build-ID] libminecraftpe.so path: ...
+   [Build-ID] Loaded GNU Build-ID: ...
+   [Build-ID] Matches known RE binary (712509dc14ccc233e91f267937dfb46ecdcc4b68): ...
+   [GL Context] Renderer: ...
+   [GL Context] Version:  ...
    ```
 
-2. **Probe B (Camera Position Discovery)**:
+2. **Signature Diagnostics** (if any signature failed full resolution):
+   ```text
+   [SigDiag] Signature '...' failed full resolution. Running prefix scan...
+   [SigDiag]   -> Prefix 16 bytes: ...
+   [SigDiag]   -> Prefix 24 bytes: ...
+   ```
+
+3. **Pass Summary (Probe A)**:
+   ```text
+   [GLTrace] ==================== PASS SUMMARY: in_world ====================
+   [GLTrace] SEGMENT #...: FBO ... | Viewport: [...] | Attachments: [...]
+   [GLTrace]   Draws: ... | SUM(count): ... | Instanced: ...
+   [GLTrace]   State: DepthTest=..., DepthMask=..., Blend=... | Distinct Programs: ...
+   [GLTrace] >>> TERRAIN CANDIDATE: Segment #... <<<
+   [GLTrace] TOP 3 CANDIDATE SEGMENTS ...
+   ```
+
+4. **Camera Coordinates (Probe B)**:
    ```text
    [Probe B: CameraProbe] ==================== CAMERA DIFF ANALYSIS ====================
    [Probe B] CANDIDATE WORLD COORDS [a0 (LevelRendererCamera)] at +0x...

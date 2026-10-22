@@ -113,6 +113,7 @@ add_library(${MOD_LIBRARY_NAME} SHARED
     src/main.cpp
     src/mod/CameraProbe.cpp
     src/mod/Config.cpp
+    src/mod/ElfDiag.cpp
     src/mod/FileLog.cpp
     src/mod/GlTrace.cpp
     src/mod/LdbReader.cpp

@@ -32,6 +32,7 @@ struct ModConfig {
 
     /** Probe A: GL Frame Trace */
     bool traceFrame = true;
+    bool traceRaw = false;
     std::string traceLabel = "";
 
     /** Probe B: Camera Position Discovery */

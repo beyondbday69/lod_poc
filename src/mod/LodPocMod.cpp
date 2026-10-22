@@ -1,4 +1,5 @@
 #include "mod/LodPocMod.h"
+#include "mod/ElfDiag.h"
 #include "mod/WorldReader.h"
 #include "signatures.h"
 
@@ -301,7 +302,7 @@ bool LodPocMod::load() {
             logAll(LogLevel::Warn, "Failed to read config.json, using defaults");
         } else {
             const auto &cfg = mConfigFile->value();
-            GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceLabel);
+            GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel);
             CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
         }
         logAll(LogLevel::Info, "Loaded successfully");
@@ -318,10 +319,15 @@ bool LodPocMod::enable() {
     try {
         logAll(LogLevel::Info, "Enabling LOD PoC diagnostic probes...");
 
-        // Resolve and log libminecraftpe.so base address
-        const uintptr_t mcBase = getModuleBase(kMinecraftLibrary);
-        sMinecraftBase.store(mcBase, std::memory_order_relaxed);
-        logAll(LogLevel::Info, "{} base address: 0x{:016x}", kMinecraftLibrary, mcBase);
+        // Inspect libminecraftpe.so ELF, on-disk path, file size, and GNU build-id
+        mElfInfo = ElfDiag::inspectMinecraftBinary();
+        sMinecraftBase.store(mElfInfo.baseAddress, std::memory_order_relaxed);
+        logAll(LogLevel::Info, "libminecraftpe.so base address: 0x{:016x}", mElfInfo.baseAddress);
+        logAll(LogLevel::Info, "[Build-ID] Path: {}", mElfInfo.path);
+        logAll(LogLevel::Info, "[Build-ID] File size: {} bytes ({:.2f} MB)", mElfInfo.fileSize, mElfInfo.fileSize / (1024.0 * 1024.0));
+        logAll(LogLevel::Info, "[Build-ID] Loaded GNU Build-ID: {}", mElfInfo.buildId);
+        logAll(LogLevel::Info, "[Build-ID] Matches known RE binary (712509dc14ccc233e91f267937dfb46ecdcc4b68): {}",
+               mElfInfo.matchesKnownReBuild ? "YES (EXACT MATCH)" : "NO (DIFFERENT BUILD)");
 
         // Install crash capture handlers
         installCrashHandlers();
@@ -405,6 +411,7 @@ void LodPocMod::installProbes() {
         mc_signatures::kSigChunkLightingTask, kMinecraftLibrary);
     if (lightingAddr == 0) {
         logAll(LogLevel::Warn, "[Probe 1: lightingTask] NOT FOUND (sig failed)");
+        ElfDiag::runSignatureDiagnostics(mc_signatures::kSigChunkLightingTask, "ChunkSource::_lightingTask", mElfInfo);
     } else {
         void *orig = nullptr;
         pl::memory::HookHandle handle(
@@ -463,6 +470,7 @@ void LodPocMod::installProbes() {
                subChunkAddr);
     } else {
         logAll(LogLevel::Warn, "[Probe 4: SubChunk::getBlock] NOT FOUND (sig failed)");
+        ElfDiag::runSignatureDiagnostics(mc_signatures::kSigSubChunkGetBlockStorage, "SubChunk::getBlock", mElfInfo);
     }
 
     // -------------------------------------------------------------------------
@@ -472,6 +480,7 @@ void LodPocMod::installProbes() {
         mc_signatures::kSigLevelRendererCameraCull, kMinecraftLibrary);
     if (cullAddr == 0) {
         logAll(LogLevel::Warn, "[Probe 5: cullPointOrChunk] NOT FOUND (sig failed)");
+        ElfDiag::runSignatureDiagnostics(mc_signatures::kSigLevelRendererCameraCull, "LevelRendererCamera::cullPointOrChunk", mElfInfo);
     } else {
         void *orig = nullptr;
         pl::memory::HookHandle handle(
@@ -525,7 +534,7 @@ void LodPocMod::checkConfigReload() {
         if (mConfigFile) {
             if (mConfigFile->load()) {
                 const auto &cfg = mConfigFile->value();
-                GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceLabel);
+                GlTrace::instance().setConfig(cfg.traceFrame, cfg.traceRaw, cfg.traceLabel);
                 CameraProbe::instance().setConfig(cfg.probeCameraDiff, cfg.userNote);
             }
         }
@@ -583,8 +592,18 @@ EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
     const uint64_t frame = ++mod.mFrameCount;
     const pid_t tid = getThreadId();
 
+    static std::atomic<bool> sLoggedGlVersion{false};
+    if (!sLoggedGlVersion.exchange(true)) {
+        const GLubyte *renderer = glGetString(GL_RENDERER);
+        const GLubyte *version = glGetString(GL_VERSION);
+        const GLubyte *vendor = glGetString(GL_VENDOR);
+        logAll(LogLevel::Info, "[GL Context] Renderer: {}", renderer ? reinterpret_cast<const char *>(renderer) : "unknown");
+        logAll(LogLevel::Info, "[GL Context] Version:  {}", version ? reinterpret_cast<const char *>(version) : "unknown");
+        logAll(LogLevel::Info, "[GL Context] Vendor:   {}", vendor ? reinterpret_cast<const char *>(vendor) : "unknown");
+    }
+
     // Probe A: GL frame trace & render thread tracking
-    GlTrace::instance().onSwapBuffers(frame);
+    GlTrace::instance().onSwapBuffers(frame, mod.mCurrentFps.load(std::memory_order_relaxed));
 
     // Refresh config periodically
     mod.checkConfigReload();
@@ -626,6 +645,7 @@ EGLBoolean LodPocMod::swapBuffersDetour(EGLDisplay dpy, EGLSurface surf) {
             mod.mLastFpsFrame.store(frame, std::memory_order_relaxed);
             mod.mLastFpsReport = now;
             const double fps = (sec > 0.0) ? (static_cast<double>(frame - prev) / sec) : 0.0;
+            mod.mCurrentFps.store(fps, std::memory_order_relaxed);
             logAll(LogLevel::Info,
                    "[Probe 3: eglSwapBuffers] alive frame={} fps={:.2f} (total_frames={}), tid={}",
                    frame, fps, frame, tid);

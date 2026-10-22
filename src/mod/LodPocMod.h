@@ -11,6 +11,7 @@
 
 #include "mod/CameraProbe.h"
 #include "mod/Config.h"
+#include "mod/ElfDiag.h"
 #include "mod/FileLog.h"
 #include "mod/GlTrace.h"
 
@@ -92,6 +93,9 @@ class LodPocMod {
     mutable std::mutex mConfigMutex;
     std::optional<pl::config::ConfigFile<ModConfig>> mConfigFile;
     std::chrono::steady_clock::time_point mLastConfigCheck{};
+
+    MinecraftElfInfo mElfInfo{};
+    std::atomic<double> mCurrentFps{60.0};
 
     // Probe 1: ChunkSource::_lightingTask
     pl::memory::HookHandle mLightingHook;
