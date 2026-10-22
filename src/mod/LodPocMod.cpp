@@ -223,7 +223,7 @@ static void restoreCrashHandlers() {
 // Module Base Resolver
 // -----------------------------------------------------------------------------
 
-static uintptr_t getModuleBase(const char *moduleName) {
+[[maybe_unused]] static uintptr_t getModuleBase(const char *moduleName) {
     struct Match {
         const char *name;
         uintptr_t base;

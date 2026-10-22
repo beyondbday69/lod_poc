@@ -117,8 +117,6 @@ std::string attachmentToString(GLenum att) {
         case 0x821A:                      return "DEPTH_STENCIL_ATTACHMENT";
         case 0x8CD5:                      return "COLOR_ATTACHMENT0";
         case 0x84F9:                      return "DEPTH_ATTACHMENT_EXT";
-        case 0x8D00:                      return "COLOR_ATTACHMENT0_EXT";
-        case 0x8D20:                      return "STENCIL_ATTACHMENT_EXT";
         default:                          return fmt::format("0x{:x}", att);
     }
 }
