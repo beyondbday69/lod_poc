@@ -63,7 +63,7 @@ struct ModConfig {
     float poc3dDist = 8.0f;
 
     /** Stage 4: LOD Terrain Distance Cutoffs (blocks) */
-    float minLodDist = 64.0f;
+    float minLodDist = 80.0f;
     float maxLodDist = 512.0f;
 };
 

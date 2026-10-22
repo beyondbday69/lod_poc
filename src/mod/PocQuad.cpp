@@ -367,15 +367,35 @@ void PocQuad::applyPendingOrigin() {
         mOriginX = mDiscoveredPlayerPos[0];
         mOriginY = mDiscoveredPlayerPos[1];
         mOriginZ = mDiscoveredPlayerPos[2];
-        mTrackedCameraPos[0] = mOriginX;
-        mTrackedCameraPos[1] = mOriginY + 1.620f;
-        mTrackedCameraPos[2] = mOriginZ;
+        mOriginValid = true;
+
+        // mTrackedCameraPos started at (0.0, 1.620, 0.0) under auto-origin.
+        // Add the base origin to preserve any movement delta accumulated before LevelDB resolved!
+        mTrackedCameraPos[0] += mOriginX;
+        mTrackedCameraPos[1] += mOriginY;
+        mTrackedCameraPos[2] += mOriginZ;
+
+        // Snap to exact chunk fractional phase immediately if chunks are visible
+        if (!mCurrentTranslations.empty()) {
+            const auto &sampleT = mCurrentTranslations.front();
+            const float obsFrac[3] = {
+                chunkmath::positiveMod16(-sampleT.x),
+                chunkmath::positiveMod16(-sampleT.y),
+                chunkmath::positiveMod16(-sampleT.z),
+            };
+            for (int i = 0; i < 3; ++i) {
+                float curFrac = chunkmath::positiveMod16(mTrackedCameraPos[i]);
+                float diff = chunkmath::circularDifference16(obsFrac[i], curFrac);
+                if (std::fabs(diff) < 2.0f) {
+                    mTrackedCameraPos[i] += diff;
+                }
+            }
+        }
+
         mAutoOrigin = false;
         mCameraTracked = true;
         mSignDetected = true;
         mTranslationSign = -1.0f;
-        mTrackerPrimed = false;
-        mPreviousTranslations.clear();
         mCubeAnchored = false;
         LodPocMod::logAll(LogLevel::Info,
             "[PocQuad: Origin] Auto-calibrated camera to discovered world origin: ({:.4f}, {:.4f}, {:.4f}) with eyeHeight=+1.62",
@@ -638,20 +658,41 @@ void PocQuad::updateCameraTracking(uint64_t frameCount) {
     const float deltaZ = mTranslationSign * match.shift.z;
     const float jump = std::sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
 
-    mTrackedCameraPos[0] += deltaX;
-    mTrackedCameraPos[1] += deltaY;
-    mTrackedCameraPos[2] += deltaZ;
-
-    if (jump > 1.0f) {
+    if (jump > 2.5f) {
         const auto now = std::chrono::steady_clock::now();
         if (now - mLastCameraWarnTime >= std::chrono::seconds(1)) {
             mLastCameraWarnTime = now;
             LodPocMod::logAll(LogLevel::Warn,
-                "[PocQuad: Camera] WARNING: camera jumped {:.4f} blocks in one frame at frame {} (shift=({:.4f}, {:.4f}, {:.4f}), matches={}/{}); new camera=({:.4f}, {:.4f}, {:.4f})",
+                "[PocQuad: Camera] REJECTED camera jump of {:.4f} blocks at frame {} (shift=({:.4f}, {:.4f}, {:.4f}), matches={}/{})",
                 jump, frameCount,
                 deltaX, deltaY, deltaZ,
-                match.matches, match.previousCount,
-                mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2]);
+                match.matches, match.previousCount);
+        }
+        mPreviousTranslations = mCurrentTranslations;
+        return;
+    }
+
+    mTrackedCameraPos[0] += deltaX;
+    mTrackedCameraPos[1] += deltaY;
+    mTrackedCameraPos[2] += deltaZ;
+
+    // Fractional phase-lock:
+    // Continuous zero-drift sync to chunk translations.
+    // Chunk translations are: -t_i = cameraPos (mod 16).
+    // Snap mTrackedCameraPos fractional component to the exact GPU translation.
+    if (mOriginValid && !mCurrentTranslations.empty()) {
+        const auto &sampleT = mCurrentTranslations.front();
+        const float obsFrac[3] = {
+            chunkmath::positiveMod16(mTranslationSign < 0.0f ? -sampleT.x : sampleT.x),
+            chunkmath::positiveMod16(mTranslationSign < 0.0f ? -sampleT.y : sampleT.y),
+            chunkmath::positiveMod16(mTranslationSign < 0.0f ? -sampleT.z : sampleT.z),
+        };
+        for (int i = 0; i < 3; ++i) {
+            float curFrac = chunkmath::positiveMod16(mTrackedCameraPos[i]);
+            float diff = chunkmath::circularDifference16(obsFrac[i], curFrac);
+            if (std::fabs(diff) < 0.5f) {
+                mTrackedCameraPos[i] += diff;
+            }
         }
     }
 
@@ -1111,7 +1152,6 @@ void PocQuad::uploadPendingLodMeshes() {
 
 void PocQuad::drawLodTerrain(GLuint targetFbo, GLenum terrainDepthFunc) {
     (void)targetFbo;
-    (void)terrainDepthFunc;
 
     uploadPendingLodMeshes();
     if (mLodGlBuffers.empty()) return;
@@ -1120,7 +1160,17 @@ void PocQuad::drawLodTerrain(GLuint targetFbo, GLenum terrainDepthFunc) {
         if (!initLodGL()) return;
     }
 
-    glDisable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_TRUE);
+
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.0f, 1.0f);
+
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CCW);
+
     glUseProgram(mLodProgram);
     glUniformMatrix4fv(mLodLocProj, 1, GL_FALSE, mProjMatrix);
     glUniformMatrix4fv(mLodLocView, 1, GL_FALSE, mViewMatrix);
@@ -1133,6 +1183,9 @@ void PocQuad::drawLodTerrain(GLuint targetFbo, GLenum terrainDepthFunc) {
         glDrawElements(GL_TRIANGLES, buf.indexCount, GL_UNSIGNED_INT, nullptr);
     }
     glBindVertexArray(0);
+
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glDepthFunc(terrainDepthFunc != 0 ? terrainDepthFunc : GL_LEQUAL);
 }
 
 void PocQuad::drawCube(GLuint targetFbo, GLenum terrainDepthFunc) {
@@ -1546,7 +1599,9 @@ void PocQuad::onBindFramebufferBefore(GLuint newFbo, GLuint currentBoundFbo, uin
     // World-pass trigger.  The >30 threshold matches the world detector; the
     // in-world gate is the primary protection against drawing in menus.
     if (currentBoundFbo == 0 && newFbo != 0 && frameDraws > 30) {
-        if (mPoc3d.load(std::memory_order_relaxed) && mHasProjMatrix && mHasViewMatrix) {
+        const bool shouldDraw3d = (mPoc3d.load(std::memory_order_relaxed) || !mLodGlBuffers.empty() || mHasNewLodMeshes) &&
+                                  mHasProjMatrix && mHasViewMatrix;
+        if (shouldDraw3d) {
             drawCube(0, terrainDepthFunc);
         } else {
             drawQuad(0, terrainDepthFunc, depthInvalidated);
@@ -1570,7 +1625,9 @@ void PocQuad::onClearAfter(GLbitfield mask, GLuint currentBoundFbo, uint64_t fra
     // Trigger condition:
     // Depth clear on FBO 0 and in-world (draw counter > 30)
     if ((mask & GL_DEPTH_BUFFER_BIT) && currentBoundFbo == 0 && frameDraws > 30) {
-        if (mPoc3d.load(std::memory_order_relaxed) && mHasProjMatrix && mHasViewMatrix) {
+        const bool shouldDraw3d = (mPoc3d.load(std::memory_order_relaxed) || !mLodGlBuffers.empty() || mHasNewLodMeshes) &&
+                                  mHasProjMatrix && mHasViewMatrix;
+        if (shouldDraw3d) {
             drawCube(0, terrainDepthFunc);
         } else {
             drawQuad(0, terrainDepthFunc, false);

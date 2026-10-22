@@ -38,6 +38,14 @@ inline float circularDistance16(float a, float b) {
     return std::min(d, 16.0f - d);
 }
 
+/// Signed circular difference in [-8, +8). target - current
+inline float circularDifference16(float target, float current) {
+    float diff = positiveMod16(target) - positiveMod16(current);
+    if (diff > 8.0f) diff -= 16.0f;
+    if (diff < -8.0f) diff += 16.0f;
+    return diff;
+}
+
 struct ShiftMatch {
     bool found{false};
     Vec3f shift{};
@@ -169,6 +177,12 @@ inline ShiftMatch findBestShift(const std::vector<Vec3f> &previous,
         const Vec3f &p = previous[order[sample]];
         for (const Vec3f &q : current) {
             const Vec3f delta{q.x - p.x, q.y - p.y, q.z - p.z};
+            // REJECT any delta > 2.5 blocks. Chunks are spaced by multiples of 16 blocks.
+            // Any pair with |delta| >= 2.5 is pairing different chunks (grid aliasing)
+            // which caused catastrophic 64-block and 80-block jumps!
+            if (std::fabs(delta.x) > 2.5f || std::fabs(delta.y) > 2.5f || std::fabs(delta.z) > 2.5f) {
+                continue;
+            }
             auto &accum = bins[detail::binKey(delta, kInverseBinSize)];
             accum.sx += delta.x;
             accum.sy += delta.y;
