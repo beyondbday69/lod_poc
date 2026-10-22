@@ -119,6 +119,7 @@ private:
     GLuint mVbo{0};
 
     // 3D Matrix & World Anchor state
+    GLuint mTerrainProgram{0};
     bool mHasProjMatrix{false};
     float mProjMatrix[16]{0};
     bool mHasViewMatrix{false};

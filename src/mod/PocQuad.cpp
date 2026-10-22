@@ -264,37 +264,16 @@ void PocQuad::setOriginConfig(float x, float y, float z, bool valid) {
     mOriginRequestInitialized = true;
 }
 
-void PocQuad::onUniformMatrix4fv(GLuint /*program*/, GLint /*location*/, GLsizei count, GLboolean transpose, const GLfloat *value) {
+void PocQuad::onUniformMatrix4fv(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
     if (value == nullptr || count < 1 || transpose) return;
 
     for (GLsizei i = 0; i < count; ++i) {
         const float *m = value + (i * 16);
 
-        // Detect Projection Matrix
-        // Standard perspective: M[11] == -1.0f (or close) and M[0] > 0.1f, M[5] > 0.1f
-        if (isPerspectiveMatrix(m)) {
-            std::copy(m, m + 16, mProjMatrix);
-            mHasProjMatrix = true;
-            mCaptureHasPerspective = true;
-        }
-
-        // Detect View (Rotation) Matrix:
-        // Pure 3x3 rotation: M[12]==0, M[13]==0, M[14]==0, M[15]==1.0
-        // and row lengths == 1.0
-        if (std::abs(m[12]) < 0.001f && std::abs(m[13]) < 0.001f && std::abs(m[14]) < 0.001f &&
-            std::abs(m[15] - 1.0f) < 0.001f && std::abs(m[3]) < 0.001f && std::abs(m[7]) < 0.001f) {
-            float r0 = m[0]*m[0] + m[1]*m[1] + m[2]*m[2];
-            float r1 = m[4]*m[4] + m[5]*m[5] + m[6]*m[6];
-            float r2 = m[8]*m[8] + m[9]*m[9] + m[10]*m[10];
-            if (std::abs(r0 - 1.0f) < 0.08f && std::abs(r1 - 1.0f) < 0.08f && std::abs(r2 - 1.0f) < 0.08f) {
-                std::copy(m, m + 16, mViewMatrix);
-                mHasViewMatrix = true;
-            }
-        }
-
         // Detect Chunk Model Translation:
         // M[0]==1, M[5]==1, M[10]==1, M[15]==1, M[1..11] == 0, M[12..14] != 0
         if (isChunkTranslationMatrix(m)) {
+            mTerrainProgram = program; // Confirm this program draws 3D terrain chunks!
             const chunkmath::Vec3f translation{m[12], m[13], m[14]};
             const TranslationKey key{
                 quantizeTranslation(translation.x),
@@ -310,6 +289,37 @@ void PocQuad::onUniformMatrix4fv(GLuint /*program*/, GLint /*location*/, GLsizei
             mLastChunkTranslation[1] = translation.y;
             mLastChunkTranslation[2] = translation.z;
             mHasChunkOffset = true;
+        }
+
+        // Detect Projection Matrix
+        // Standard perspective: M[11] == -1.0f (or close) and M[0] > 0.1f, M[5] > 0.1f
+        if (isPerspectiveMatrix(m)) {
+            std::copy(m, m + 16, mProjMatrix);
+            mHasProjMatrix = true;
+            mCaptureHasPerspective = true;
+        }
+
+        // Detect View (Rotation) Matrix:
+        // Pure 3x3 rotation: M[12]==0, M[13]==0, M[14]==0, M[15]==1.0
+        // and row lengths == 1.0.
+        // CRITICAL: Reject pure identity matrices from UI/HUD/post-processing shaders
+        // (like Prog 3 at end of frame). Otherwise Identity overwrites the real view
+        // matrix, causing the 3D cube to pin to the screen and follow camera rotation!
+        if (std::abs(m[12]) < 0.001f && std::abs(m[13]) < 0.001f && std::abs(m[14]) < 0.001f &&
+            std::abs(m[15] - 1.0f) < 0.001f && std::abs(m[3]) < 0.001f && std::abs(m[7]) < 0.001f) {
+            float r0 = m[0]*m[0] + m[1]*m[1] + m[2]*m[2];
+            float r1 = m[4]*m[4] + m[5]*m[5] + m[6]*m[6];
+            float r2 = m[8]*m[8] + m[9]*m[9] + m[10]*m[10];
+            if (std::abs(r0 - 1.0f) < 0.08f && std::abs(r1 - 1.0f) < 0.08f && std::abs(r2 - 1.0f) < 0.08f) {
+                bool isIdent = std::abs(m[0] - 1.0f) < 0.001f && std::abs(m[5] - 1.0f) < 0.001f &&
+                               std::abs(m[10] - 1.0f) < 0.001f && std::abs(m[1]) < 0.001f &&
+                               std::abs(m[2]) < 0.001f && std::abs(m[4]) < 0.001f &&
+                               std::abs(m[6]) < 0.001f && std::abs(m[8]) < 0.001f && std::abs(m[9]) < 0.001f;
+                if (!isIdent || (mTerrainProgram != 0 && program == mTerrainProgram)) {
+                    std::copy(m, m + 16, mViewMatrix);
+                    mHasViewMatrix = true;
+                }
+            }
         }
     }
 }
@@ -1396,13 +1406,17 @@ void PocQuad::onWorldFrame(bool inWorld, double currentFps, uint64_t frameCount)
         if (mPoc3d.load(std::memory_order_relaxed) && mHasProjMatrix && mHasViewMatrix) {
             float offset[3];
             computeCubeModelOffset(offset);
+            float fwdX = -mViewMatrix[2];
+            float fwdY = -mViewMatrix[6];
+            float fwdZ = -mViewMatrix[10];
             LodPocMod::logAll(LogLevel::Info,
-                "[PocQuad: 3D] Telemetry: draws={}, anchored={}, absoluteAnchor={}, originMode={}, camera=({:.2f},{:.2f},{:.2f}), cubeOffset=({:.2f},{:.2f},{:.2f}), fps={:.1f}{}",
+                "[PocQuad: 3D] Telemetry: draws={}, anchored={}, absoluteAnchor={}, originMode={}, camera=({:.2f},{:.2f},{:.2f}), fwd=({:.2f},{:.2f},{:.2f}), cubeOffset=({:.2f},{:.2f},{:.2f}), fps={:.1f}{}",
                 mTotalDrawCount,
                 mCubeAnchored ? "true" : "false",
                 mAbsoluteAnchor ? "true" : "false",
                 mAutoOrigin ? "auto-relative (zero-config, eyeHeight=+1.62)" : "absolute",
                 mTrackedCameraPos[0], mTrackedCameraPos[1], mTrackedCameraPos[2],
+                fwdX, fwdY, fwdZ,
                 offset[0], offset[1], offset[2],
                 currentFps,
                 mTotalDrawCount == 0 ? " (WAITING FOR TRIGGER)" : "");
