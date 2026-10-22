@@ -38,6 +38,9 @@ struct ModConfig {
     /** Probe B: Camera Position Discovery */
     bool probeCameraDiff = true;
     std::string userNote = "";
+
+    /** Build-ID safety gate: require known RE binary for signature-based hooks */
+    bool requireKnownBuild = true;
 };
 
 nlohmann::json makeDefaultConfigJson();

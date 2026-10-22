@@ -4,31 +4,62 @@
 #include <elf.h>
 #include <link.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
+#include <unistd.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <vector>
 
+#include <pl/memory/Signature.hpp>
+
 namespace lod_poc {
 
 namespace {
 
+constexpr const char *kMinecraftLibrary = "libminecraftpe.so";
 constexpr const char *kKnownReBuildId = "712509dc14ccc233e91f267937dfb46ecdcc4b68";
+
+bool safeReadMem(uintptr_t addr, void *dst, size_t len) {
+    if (addr < 0x10000 || dst == nullptr || len == 0) return false;
+    struct iovec local{dst, len};
+    struct iovec remote{reinterpret_cast<void *>(addr), len};
+    ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    return n == static_cast<ssize_t>(len);
+}
 
 std::string parseGnuBuildId(uintptr_t base) {
     if (base == 0) return "";
-    const auto *ehdr = reinterpret_cast<const Elf64_Ehdr *>(base);
-    if (std::memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 || ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+
+    Elf64_Ehdr ehdr{};
+    if (!safeReadMem(base, &ehdr, sizeof(ehdr))) {
         return "";
     }
 
-    const auto *phdr = reinterpret_cast<const Elf64_Phdr *>(base + ehdr->e_phoff);
-    for (int i = 0; i < ehdr->e_phnum; ++i) {
-        if (phdr[i].p_type != PT_NOTE) continue;
+    if (std::memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 || ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+        return "";
+    }
 
-        const uint8_t *notePtr = reinterpret_cast<const uint8_t *>(base + phdr[i].p_vaddr);
-        const uint8_t *noteEnd = notePtr + phdr[i].p_memsz;
+    for (int i = 0; i < ehdr.e_phnum; ++i) {
+        Elf64_Phdr phdr{};
+        uintptr_t phdrAddr = base + ehdr.e_phoff + (i * sizeof(Elf64_Phdr));
+        if (!safeReadMem(phdrAddr, &phdr, sizeof(phdr))) {
+            continue;
+        }
+
+        if (phdr.p_type != PT_NOTE || phdr.p_memsz == 0 || phdr.p_memsz > 65536) {
+            continue;
+        }
+
+        std::vector<uint8_t> noteBuf(phdr.p_memsz);
+        if (!safeReadMem(base + phdr.p_vaddr, noteBuf.data(), noteBuf.size())) {
+            continue;
+        }
+
+        const uint8_t *notePtr = noteBuf.data();
+        const uint8_t *noteEnd = notePtr + noteBuf.size();
 
         while (notePtr + 12 <= noteEnd) {
             uint32_t namesz = *reinterpret_cast<const uint32_t *>(notePtr);
@@ -59,41 +90,29 @@ std::string parseGnuBuildId(uintptr_t base) {
     return "";
 }
 
-struct ParsedSigByte {
-    uint8_t byte{0};
-    bool isWildcard{false};
-};
-
-std::vector<ParsedSigByte> parseSignature(std::string_view sig) {
-    std::vector<ParsedSigByte> result;
+std::string truncatePatternToBytes(std::string_view sig, size_t targetBytes) {
+    std::string result;
+    size_t byteCount = 0;
     size_t i = 0;
-    while (i < sig.size()) {
+
+    while (i < sig.size() && byteCount < targetBytes) {
         while (i < sig.size() && (sig[i] == ' ' || sig[i] == '\t' || sig[i] == '\n' || sig[i] == '\r')) {
             i++;
         }
         if (i >= sig.size()) break;
 
-        if (sig[i] == '?') {
-            ParsedSigByte b;
-            b.isWildcard = true;
-            result.push_back(b);
-            i++;
-            if (i < sig.size() && sig[i] == '?') i++;
-        } else if (i + 1 < sig.size()) {
-            char hexStr[3] = { sig[i], sig[i + 1], '\0' };
-            char *endPtr = nullptr;
-            unsigned long val = strtoul(hexStr, &endPtr, 16);
-            if (endPtr != hexStr) {
-                ParsedSigByte b;
-                b.byte = static_cast<uint8_t>(val);
-                b.isWildcard = false;
-                result.push_back(b);
-            }
-            i += 2;
-        } else {
+        size_t tokenStart = i;
+        while (i < sig.size() && sig[i] != ' ' && sig[i] != '\t' && sig[i] != '\n' && sig[i] != '\r') {
             i++;
         }
+
+        if (!result.empty()) {
+            result += ' ';
+        }
+        result.append(sig.substr(tokenStart, i - tokenStart));
+        byteCount++;
     }
+
     return result;
 }
 
@@ -118,15 +137,11 @@ MinecraftElfInfo ElfDiag::inspectMinecraftBinary() {
             size_t dash = rangeStr.find('-');
             if (dash != std::string::npos) {
                 uintptr_t start = std::strtoull(rangeStr.substr(0, dash).c_str(), nullptr, 16);
-                uintptr_t end = std::strtoull(rangeStr.substr(dash + 1).c_str(), nullptr, 16);
 
                 if (info.baseAddress == 0) {
                     info.baseAddress = start;
                     info.path = pathStr;
-                }
-                if (permsStr.find('x') != std::string::npos) {
-                    if (info.execStart == 0) info.execStart = start;
-                    info.execEnd = end;
+                    break;
                 }
             }
         }
@@ -149,65 +164,38 @@ MinecraftElfInfo ElfDiag::inspectMinecraftBinary() {
 }
 
 void ElfDiag::runSignatureDiagnostics(std::string_view sigPattern,
-                                      std::string_view sigName,
-                                      const MinecraftElfInfo &elfInfo) {
-    LodPocMod::logAll(LogLevel::Warn, "[SigDiag] Signature '{}' failed full resolution. Running prefix scan...", sigName);
+                                      std::string_view sigName) {
+    LodPocMod::logAll(LogLevel::Warn, "[SigDiag] Signature '{}' failed full resolution. Checking prefix lengths...", sigName);
 
-    if (elfInfo.execStart == 0 || elfInfo.execEnd <= elfInfo.execStart) {
-        LodPocMod::logAll(LogLevel::Error, "[SigDiag] Executable memory range of libminecraftpe.so not available for scanning.");
-        return;
-    }
+    const std::vector<size_t> testLengths = {16, 24, 32, 40};
+    bool anyFound = false;
 
-    std::vector<ParsedSigByte> fullPattern = parseSignature(sigPattern);
-    if (fullPattern.empty()) {
-        LodPocMod::logAll(LogLevel::Error, "[SigDiag] Failed to parse signature pattern tokens.");
-        return;
-    }
+    for (size_t numBytes : testLengths) {
+        std::string prefixPattern = truncatePatternToBytes(sigPattern, numBytes);
+        if (prefixPattern.empty()) continue;
 
-    const uint8_t *textStart = reinterpret_cast<const uint8_t *>(elfInfo.execStart);
-    const size_t textSize = elfInfo.execEnd - elfInfo.execStart;
-
-    const std::vector<size_t> testPrefixLengths = {16, 24, 32, 40};
-    bool anyMatched = false;
-
-    for (size_t prefixLen : testPrefixLengths) {
-        if (prefixLen > fullPattern.size()) continue;
-
-        size_t matchCount = 0;
-        uintptr_t firstMatchVA = 0;
-
-        if (textSize >= prefixLen) {
-            for (size_t off = 0; off <= textSize - prefixLen; ++off) {
-                bool match = true;
-                for (size_t p = 0; p < prefixLen; ++p) {
-                    if (!fullPattern[p].isWildcard && textStart[off + p] != fullPattern[p].byte) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) {
-                    matchCount++;
-                    if (firstMatchVA == 0) {
-                        firstMatchVA = elfInfo.execStart + off;
-                    }
-                }
-            }
+        uintptr_t resolved = 0;
+        try {
+            resolved = pl::memory::resolveSignature(prefixPattern, kMinecraftLibrary);
+        } catch (...) {
+            resolved = 0;
         }
 
-        if (matchCount > 0) {
-            anyMatched = true;
+        if (resolved != 0) {
+            anyFound = true;
             LodPocMod::logAll(LogLevel::Info,
-                              "[SigDiag]   -> Prefix {:2d} bytes: {} match(es) (first VA=0x{:08x}, offset=+0x{:08x})",
-                              prefixLen, matchCount, firstMatchVA, firstMatchVA - elfInfo.baseAddress);
+                              "[SigDiag]   -> Prefix {:2d} bytes: RESOLVED at 0x{:x}",
+                              numBytes, resolved);
         } else {
             LodPocMod::logAll(LogLevel::Info,
-                              "[SigDiag]   -> Prefix {:2d} bytes: 0 matches",
-                              prefixLen);
+                              "[SigDiag]   -> Prefix {:2d} bytes: NOT FOUND",
+                              numBytes);
         }
     }
 
-    if (!anyMatched) {
-        LodPocMod::logAll(LogLevel::Warn, "[SigDiag]   -> no match for any prefix (16, 24, 32, 40 bytes) across .text.");
+    if (!anyFound) {
+        LodPocMod::logAll(LogLevel::Warn,
+                          "[SigDiag]   -> no match for any prefix (16, 24, 32, 40 bytes).");
     }
 }
 

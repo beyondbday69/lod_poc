@@ -275,6 +275,18 @@ bool LodPocMod::load() {
         // Initialize file logger in mod data directory
         FileLog::instance().open(self.getDataDir());
 
+        // Immediately inspect libminecraftpe.so and log build-id as the very first lines
+        mElfInfo = ElfDiag::inspectMinecraftBinary();
+        sMinecraftBase.store(mElfInfo.baseAddress, std::memory_order_relaxed);
+
+        logAll(LogLevel::Info, "================================================================");
+        logAll(LogLevel::Info, "[Init] libminecraftpe.so Build-ID: {}", mElfInfo.buildId.empty() ? "UNKNOWN" : mElfInfo.buildId);
+        logAll(LogLevel::Info, "[Init] libminecraftpe.so Path:     {}", mElfInfo.path.empty() ? "UNKNOWN" : mElfInfo.path);
+        logAll(LogLevel::Info, "[Init] libminecraftpe.so Size:     {} bytes ({:.2f} MB)", mElfInfo.fileSize, mElfInfo.fileSize / (1024.0 * 1024.0));
+        logAll(LogLevel::Info, "[Init] Build Match (712509dc14ccc233e91f267937dfb46ecdcc4b68): {}",
+               mElfInfo.matchesKnownReBuild ? "YES (EXACT MATCH)" : "NO (BUILD MISMATCH)");
+        logAll(LogLevel::Info, "================================================================");
+
         logAll(LogLevel::Info, "Loading LOD PoC mod v{} (author: {})...",
                self.getVersion(), self.getAuthor());
         logAll(LogLevel::Info, "Target Minecraft Bedrock: 1.26.51.1 (arm64-v8a)");
@@ -319,20 +331,42 @@ bool LodPocMod::enable() {
     try {
         logAll(LogLevel::Info, "Enabling LOD PoC diagnostic probes...");
 
-        // Inspect libminecraftpe.so ELF, on-disk path, file size, and GNU build-id
-        mElfInfo = ElfDiag::inspectMinecraftBinary();
-        sMinecraftBase.store(mElfInfo.baseAddress, std::memory_order_relaxed);
-        logAll(LogLevel::Info, "libminecraftpe.so base address: 0x{:016x}", mElfInfo.baseAddress);
-        logAll(LogLevel::Info, "[Build-ID] Path: {}", mElfInfo.path);
-        logAll(LogLevel::Info, "[Build-ID] File size: {} bytes ({:.2f} MB)", mElfInfo.fileSize, mElfInfo.fileSize / (1024.0 * 1024.0));
-        logAll(LogLevel::Info, "[Build-ID] Loaded GNU Build-ID: {}", mElfInfo.buildId);
-        logAll(LogLevel::Info, "[Build-ID] Matches known RE binary (712509dc14ccc233e91f267937dfb46ecdcc4b68): {}",
-               mElfInfo.matchesKnownReBuild ? "YES (EXACT MATCH)" : "NO (DIFFERENT BUILD)");
+        // Ensure Minecraft base address is known
+        if (sMinecraftBase.load(std::memory_order_relaxed) == 0 && mElfInfo.baseAddress != 0) {
+            sMinecraftBase.store(mElfInfo.baseAddress, std::memory_order_relaxed);
+        }
+
+        // Check Build-ID safety gate
+        bool requireKnown = true;
+        {
+            std::lock_guard lock(mConfigMutex);
+            if (mConfigFile) {
+                requireKnown = mConfigFile->value().requireKnownBuild;
+            }
+        }
+
+        if (!mElfInfo.matchesKnownReBuild && requireKnown) {
+            logAll(LogLevel::Warn, "================================================================");
+            logAll(LogLevel::Warn, "BUILD MISMATCH: signature-based probes disabled");
+            logAll(LogLevel::Warn, "  Loaded Build-ID:   {}", mElfInfo.buildId);
+            logAll(LogLevel::Warn, "  Expected Build-ID: 712509dc14ccc233e91f267937dfb46ecdcc4b68");
+            logAll(LogLevel::Warn, "  GL/EGL probes, world reader, file log, and crash handlers remain active.");
+            logAll(LogLevel::Warn, "  (Set 'requireKnownBuild': false in config.json to override)");
+            logAll(LogLevel::Warn, "================================================================");
+        } else if (!mElfInfo.matchesKnownReBuild) {
+            logAll(LogLevel::Warn, "BUILD MISMATCH OVERRIDDEN: requireKnownBuild is false, attempting signature probes...");
+        }
 
         // Install crash capture handlers
-        installCrashHandlers();
+        try {
+            installCrashHandlers();
+        } catch (const std::exception &ex) {
+            logAll(LogLevel::Error, "installCrashHandlers() failed: {}", ex.what());
+        } catch (...) {
+            logAll(LogLevel::Error, "installCrashHandlers() failed with unknown error");
+        }
 
-        // Install probe hooks
+        // Install probe hooks defensively
         installProbes();
 
         // Trigger background LevelDB world scan if enabled
@@ -344,7 +378,13 @@ bool LodPocMod::enable() {
             }
         }
         if (shouldScanWorld) {
-            WorldReader::startBackgroundScan(getSelf().getDataDir());
+            try {
+                WorldReader::startBackgroundScan(getSelf().getDataDir());
+            } catch (const std::exception &ex) {
+                logAll(LogLevel::Error, "WorldReader::startBackgroundScan failed: {}", ex.what());
+            } catch (...) {
+                logAll(LogLevel::Error, "WorldReader::startBackgroundScan failed with unknown error");
+            }
         }
 
         logAll(LogLevel::Info, "LOD PoC mod enabled");
@@ -404,95 +444,146 @@ void LodPocMod::installProbes() {
     mLastFpsReport = now;
     mLastCullReport = now;
 
+    bool requireKnown = true;
+    {
+        std::lock_guard lock(mConfigMutex);
+        if (mConfigFile) {
+            requireKnown = mConfigFile->value().requireKnownBuild;
+        }
+    }
+    const bool skipSigProbes = requireKnown && !mElfInfo.matchesKnownReBuild;
+
     // -------------------------------------------------------------------------
-    // Probe 1: ChunkSource::_lightingTask
+    // Probe 1: ChunkSource::_lightingTask (Signature-based)
     // -------------------------------------------------------------------------
-    const auto lightingAddr = pl::memory::resolveSignature(
-        mc_signatures::kSigChunkLightingTask, kMinecraftLibrary);
-    if (lightingAddr == 0) {
-        logAll(LogLevel::Warn, "[Probe 1: lightingTask] NOT FOUND (sig failed)");
-        ElfDiag::runSignatureDiagnostics(mc_signatures::kSigChunkLightingTask, "ChunkSource::_lightingTask", mElfInfo);
+    if (skipSigProbes) {
+        logAll(LogLevel::Info, "[Probe 1: lightingTask] SKIPPED (build mismatch)");
     } else {
-        void *orig = nullptr;
-        pl::memory::HookHandle handle(
-            reinterpret_cast<void *>(lightingAddr),
-            reinterpret_cast<void *>(&LodPocMod::lightingTaskDetour),
-            &orig);
-        if (!handle.installed()) {
-            logAll(LogLevel::Error, "[Probe 1: lightingTask] FAILED at 0x{:x}", lightingAddr);
-        } else {
-            mOriginalLightingTask = reinterpret_cast<ChunkLightingTaskFn>(orig);
-            mLightingHook = std::move(handle);
-            logAll(LogLevel::Info, "[Probe 1: lightingTask] Hooked at 0x{:x}", lightingAddr);
+        try {
+            const auto lightingAddr = pl::memory::resolveSignature(
+                mc_signatures::kSigChunkLightingTask, kMinecraftLibrary);
+            if (lightingAddr == 0) {
+                logAll(LogLevel::Warn, "[Probe 1: lightingTask] NOT FOUND (sig failed)");
+                ElfDiag::runSignatureDiagnostics(mc_signatures::kSigChunkLightingTask, "ChunkSource::_lightingTask");
+            } else {
+                void *orig = nullptr;
+                pl::memory::HookHandle handle(
+                    reinterpret_cast<void *>(lightingAddr),
+                    reinterpret_cast<void *>(&LodPocMod::lightingTaskDetour),
+                    &orig);
+                if (!handle.installed()) {
+                    logAll(LogLevel::Error, "[Probe 1: lightingTask] FAILED at 0x{:x}", lightingAddr);
+                } else {
+                    mOriginalLightingTask = reinterpret_cast<ChunkLightingTaskFn>(orig);
+                    mLightingHook = std::move(handle);
+                    logAll(LogLevel::Info, "[Probe 1: lightingTask] Hooked at 0x{:x}", lightingAddr);
+                }
+            }
+        } catch (const std::exception &ex) {
+            logAll(LogLevel::Error, "[Probe 1: lightingTask] Exception: {}", ex.what());
+        } catch (...) {
+            logAll(LogLevel::Error, "[Probe 1: lightingTask] Unknown exception");
         }
     }
 
     // -------------------------------------------------------------------------
-    // Probe 2 & Probe A: OpenGL ES trace hooks
+    // Probe 2 & Probe A: OpenGL ES trace hooks (dlsym-based, independent of build)
     // -------------------------------------------------------------------------
-    GlTrace::instance().install();
+    try {
+        GlTrace::instance().install();
+    } catch (const std::exception &ex) {
+        logAll(LogLevel::Error, "[GLTrace] install() exception: {}", ex.what());
+    } catch (...) {
+        logAll(LogLevel::Error, "[GLTrace] install() unknown exception");
+    }
 
     // -------------------------------------------------------------------------
-    // Probe 3: eglSwapBuffers
+    // Probe 3: eglSwapBuffers (dlsym-based, independent of build)
     // -------------------------------------------------------------------------
-    void *swapTarget = nullptr;
-    void *eglLib = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
-    if (eglLib != nullptr) {
-        swapTarget = dlsym(eglLib, "eglSwapBuffers");
-    }
-    if (swapTarget == nullptr) {
-        swapTarget = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
-    }
-    if (swapTarget == nullptr) {
-        logAll(LogLevel::Warn, "[Probe 3: eglSwapBuffers] NOT FOUND");
-    } else {
-        void *orig = nullptr;
-        pl::memory::HookHandle handle(
-            swapTarget,
-            reinterpret_cast<void *>(&LodPocMod::swapBuffersDetour),
-            &orig);
-        if (!handle.installed()) {
-            logAll(LogLevel::Error, "[Probe 3: eglSwapBuffers] FAILED at {:p}", swapTarget);
-        } else {
-            mOriginalSwapBuffers = reinterpret_cast<EglSwapBuffersFn>(orig);
-            mSwapBuffersHook = std::move(handle);
-            logAll(LogLevel::Info, "[Probe 3: eglSwapBuffers] Hooked at {:p}", swapTarget);
+    try {
+        void *swapTarget = nullptr;
+        void *eglLib = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
+        if (eglLib != nullptr) {
+            swapTarget = dlsym(eglLib, "eglSwapBuffers");
         }
+        if (swapTarget == nullptr) {
+            swapTarget = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
+        }
+        if (swapTarget == nullptr) {
+            logAll(LogLevel::Warn, "[Probe 3: eglSwapBuffers] NOT FOUND");
+        } else {
+            void *orig = nullptr;
+            pl::memory::HookHandle handle(
+                swapTarget,
+                reinterpret_cast<void *>(&LodPocMod::swapBuffersDetour),
+                &orig);
+            if (!handle.installed()) {
+                logAll(LogLevel::Error, "[Probe 3: eglSwapBuffers] FAILED at {:p}", swapTarget);
+            } else {
+                mOriginalSwapBuffers = reinterpret_cast<EglSwapBuffersFn>(orig);
+                mSwapBuffersHook = std::move(handle);
+                logAll(LogLevel::Info, "[Probe 3: eglSwapBuffers] Hooked at {:p}", swapTarget);
+            }
+        }
+    } catch (const std::exception &ex) {
+        logAll(LogLevel::Error, "[Probe 3: eglSwapBuffers] Exception: {}", ex.what());
+    } catch (...) {
+        logAll(LogLevel::Error, "[Probe 3: eglSwapBuffers] Unknown exception");
     }
 
     // -------------------------------------------------------------------------
     // Probe 4: SubChunk::getBlock (Signature resolution ONLY - do NOT hook)
     // -------------------------------------------------------------------------
-    const auto subChunkAddr = pl::memory::resolveSignature(
-        mc_signatures::kSigSubChunkGetBlockStorage, kMinecraftLibrary);
-    if (subChunkAddr != 0) {
-        logAll(LogLevel::Info, "[Probe 4: SubChunk::getBlock] Resolved at 0x{:x} (verified formula: (x << 8) | (z << 4) | y)",
-               subChunkAddr);
+    if (skipSigProbes) {
+        logAll(LogLevel::Info, "[Probe 4: SubChunk::getBlock] SKIPPED (build mismatch)");
     } else {
-        logAll(LogLevel::Warn, "[Probe 4: SubChunk::getBlock] NOT FOUND (sig failed)");
-        ElfDiag::runSignatureDiagnostics(mc_signatures::kSigSubChunkGetBlockStorage, "SubChunk::getBlock", mElfInfo);
+        try {
+            const auto subChunkAddr = pl::memory::resolveSignature(
+                mc_signatures::kSigSubChunkGetBlockStorage, kMinecraftLibrary);
+            if (subChunkAddr != 0) {
+                logAll(LogLevel::Info, "[Probe 4: SubChunk::getBlock] Resolved at 0x{:x} (verified formula: (x << 8) | (z << 4) | y)",
+                       subChunkAddr);
+            } else {
+                logAll(LogLevel::Warn, "[Probe 4: SubChunk::getBlock] NOT FOUND (sig failed)");
+                ElfDiag::runSignatureDiagnostics(mc_signatures::kSigSubChunkGetBlockStorage, "SubChunk::getBlock");
+            }
+        } catch (const std::exception &ex) {
+            logAll(LogLevel::Error, "[Probe 4: SubChunk::getBlock] Exception: {}", ex.what());
+        } catch (...) {
+            logAll(LogLevel::Error, "[Probe 4: SubChunk::getBlock] Unknown exception");
+        }
     }
 
     // -------------------------------------------------------------------------
-    // Probe 5: LevelRendererCamera::cullPointOrChunk
+    // Probe 5: LevelRendererCamera::cullPointOrChunk (Signature-based)
     // -------------------------------------------------------------------------
-    const auto cullAddr = pl::memory::resolveSignature(
-        mc_signatures::kSigLevelRendererCameraCull, kMinecraftLibrary);
-    if (cullAddr == 0) {
-        logAll(LogLevel::Warn, "[Probe 5: cullPointOrChunk] NOT FOUND (sig failed)");
-        ElfDiag::runSignatureDiagnostics(mc_signatures::kSigLevelRendererCameraCull, "LevelRendererCamera::cullPointOrChunk", mElfInfo);
+    if (skipSigProbes) {
+        logAll(LogLevel::Info, "[Probe 5: cullPointOrChunk] SKIPPED (build mismatch)");
     } else {
-        void *orig = nullptr;
-        pl::memory::HookHandle handle(
-            reinterpret_cast<void *>(cullAddr),
-            reinterpret_cast<void *>(&LodPocMod::cullPointOrChunkDetour),
-            &orig);
-        if (!handle.installed()) {
-            logAll(LogLevel::Error, "[Probe 5: cullPointOrChunk] FAILED at 0x{:x}", cullAddr);
-        } else {
-            mOriginalCull = reinterpret_cast<CullPointOrChunkFn>(orig);
-            mCullHook = std::move(handle);
-            logAll(LogLevel::Info, "[Probe 5: cullPointOrChunk] Hooked at 0x{:x}", cullAddr);
+        try {
+            const auto cullAddr = pl::memory::resolveSignature(
+                mc_signatures::kSigLevelRendererCameraCull, kMinecraftLibrary);
+            if (cullAddr == 0) {
+                logAll(LogLevel::Warn, "[Probe 5: cullPointOrChunk] NOT FOUND (sig failed)");
+                ElfDiag::runSignatureDiagnostics(mc_signatures::kSigLevelRendererCameraCull, "LevelRendererCamera::cullPointOrChunk");
+            } else {
+                void *orig = nullptr;
+                pl::memory::HookHandle handle(
+                    reinterpret_cast<void *>(cullAddr),
+                    reinterpret_cast<void *>(&LodPocMod::cullPointOrChunkDetour),
+                    &orig);
+                if (!handle.installed()) {
+                    logAll(LogLevel::Error, "[Probe 5: cullPointOrChunk] FAILED at 0x{:x}", cullAddr);
+                } else {
+                    mOriginalCull = reinterpret_cast<CullPointOrChunkFn>(orig);
+                    mCullHook = std::move(handle);
+                    logAll(LogLevel::Info, "[Probe 5: cullPointOrChunk] Hooked at 0x{:x}", cullAddr);
+                }
+            }
+        } catch (const std::exception &ex) {
+            logAll(LogLevel::Error, "[Probe 5: cullPointOrChunk] Exception: {}", ex.what());
+        } catch (...) {
+            logAll(LogLevel::Error, "[Probe 5: cullPointOrChunk] Unknown exception");
         }
     }
 }

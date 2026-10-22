@@ -82,11 +82,28 @@ Stored in `<mod_config_dir>/config.json` (or `<mod_data_dir>/config.json`):
 | `traceLabel` | string | `""` | User label for manual re-arming (e.g. set to `"inventory"` or `"paused"` to capture a specific state). |
 | `probeCameraDiff` | boolean | `true` | Enables Probe B 3-snapshot memory diffing on `cullPointOrChunk`. |
 | `userNote` | string | `""` | Free-form notes with your recorded player coordinates at T1/T2/T3. |
+| `requireKnownBuild` | boolean | `true` | When true (default), signature-based probes are skipped if the loaded `libminecraftpe.so` GNU build-id does not match `712509dc14ccc233e91f267937dfb46ecdcc4b68`. |
 | `buildLodMap` | boolean | `true` | Enables background LevelDB scan and generation of `lod_map.png`. |
 | `probe_chunk_lighting` | boolean | `true` | Enables Probe 1 `ChunkSource::_lightingTask` hook. |
 | `probe_bind_framebuffer` | boolean | `true` | Enables Probe 2 FBO tracking. |
 | `probe_egl_swap_buffers` | boolean | `true` | Enables Probe 3 FPS and frame swap tracking. |
 | `probe_level_renderer_cull` | boolean | `true` | Enables Probe 5 `LevelRendererCamera::cullPointOrChunk` hook. |
+
+---
+
+## Build-ID Safety Gate & Signatures
+
+All game function signatures (`ChunkSource::_lightingTask`, `SubChunk::getBlock`, `LevelRendererCamera::cullPointOrChunk`) are reverse-engineered specifically against Minecraft Bedrock 1.26.51.1 arm64-v8a with GNU build-id:
+```text
+712509dc14ccc233e91f267937dfb46ecdcc4b68
+```
+
+- **Build-ID Verification**: At `load()`, the mod inspects `libminecraftpe.so` using zero-fault `process_vm_readv` ELF parsing and logs the loaded build-id, disk path, and file size on the very first lines of `lod_poc.log`.
+- **Mismatch Safety Gate**: If `requireKnownBuild` is `true` (default) and the build-id differs (e.g. patched APK, minor sub-version update, or different architecture):
+  - Signature-based probes (Probes 1, 4, 5) are **safely disabled** to prevent crashes or hooking arbitrary code.
+  - GL/EGL detours (FBO tracking, frame swap, GL frame trace), world LevelDB reader, file logging, and crash handlers **continue running normally**.
+  - To attempt resolving signatures on a non-matching binary at your own risk, set `"requireKnownBuild": false` in `config.json`.
+- **Safe Signature Diagnostics**: If a signature fails full resolution, prefix checks (16, 24, 32, 40 bytes) are delegated strictly to `pl::memory::resolveSignature`. The mod does not perform raw memory scans across `libminecraftpe.so`, preventing unmapped page faults (`SEGV_ACCERR`).
 
 ---
 
